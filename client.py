@@ -6,6 +6,7 @@ import time
 import argparse
 import logging
 from urllib.parse import urlparse
+import uuid
 
 # 配置日志
 logging.basicConfig(
@@ -18,12 +19,17 @@ logging.basicConfig(
 )
 
 class TunnelClient:
-    def __init__(self, server_host, server_port, local_host, local_port, tunnel_id, use_ssl=True):
+    def __init__(self, server_host, server_port, local_host, local_port, tunnel_id=None, subdomain=None, use_ssl=True):
         self.server_host = server_host
         self.server_port = server_port
         self.local_host = local_host
         self.local_port = local_port
-        self.tunnel_id = tunnel_id
+        # 如果提供了子域名但没有隧道ID，则使用子域名作为隧道ID
+        if subdomain and not tunnel_id:
+            self.tunnel_id = subdomain
+        else:
+            self.tunnel_id = tunnel_id or str(uuid.uuid4())[:8]  # 如果两者都没有，生成一个短UUID
+        self.subdomain = subdomain
         self.use_ssl = use_ssl
         self.running = False
         self.control_socket = None
@@ -57,6 +63,10 @@ class TunnelClient:
                         "type": "register",
                         "tunnel_id": self.tunnel_id
                     }
+                    
+                    # 如果设置了子域名，添加到注册信息中
+                    if self.subdomain:
+                        registration["subdomain"] = self.subdomain
                     
                     # 直接发送，不使用send_message方法
                     registration_json = json.dumps(registration) 
@@ -158,24 +168,25 @@ class TunnelClient:
     
     def handle_request(self, request_id, data):
         try:
-            logging.info(f"处理请求 {request_id}")
-            # 解析请求数据
-            try:
-                request_data = json.loads(data)
-                method = request_data.get("method", "GET")
-                path = request_data.get("path", "/")
-                headers = request_data.get("headers", {})
-                body = request_data.get("body", "")
-                
-                logging.info(f"请求详情: {method} {path}")
-            except json.JSONDecodeError:
-                logging.error(f"解析请求数据失败: {data[:100]}")
-                self.send_error_response(request_id, "无效的请求数据")
-                return
+            # 确保data是字典类型
+            if isinstance(data, str):
+                try:
+                    # 尝试将字符串解析为JSON
+                    data = json.loads(data)
+                except json.JSONDecodeError:
+                    # 如果无法解析为JSON，创建一个基本的请求数据
+                    data = {
+                        "method": "GET",
+                        "path": "/",
+                        "headers": {},
+                        "body": ""
+                    }
             
-            # 创建测试响应
-            self.send_test_response(request_id)
-            return
+            # 现在解析请求数据
+            method = data.get('method', 'GET')
+            path = data.get('path', '/')
+            headers = data.get('headers', {})
+            body = data.get('body', '')
             
             # 以下是实际连接本地服务的代码
             try:
@@ -400,24 +411,33 @@ class TunnelClient:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="内网穿透客户端")
     parser.add_argument("--server", required=True, help="服务器地址")
-    parser.add_argument("--server-port", type=int, default=8000, help="服务器端口")
+    parser.add_argument("--server-port", type=int, default=8000, help="服务器控制端口")
     parser.add_argument("--local", default="127.0.0.1", help="本地服务地址")
     parser.add_argument("--local-port", type=int, required=True, help="本地服务端口")
-    parser.add_argument("--tunnel-id", required=True, help="隧道ID")
+    parser.add_argument("--tunnel-id", help="隧道ID (当使用子域名时可选)")
+    parser.add_argument("--subdomain", help="要使用的子域名，如果提供将用于访问，例如：p.windy.run")
     parser.add_argument("--no-ssl", action="store_true", help="禁用SSL")
     
     args = parser.parse_args()
     
+    # 检查是否至少提供了tunnel-id或subdomain中的一个
+    if not args.tunnel_id and not args.subdomain:
+        print("错误：必须提供 --tunnel-id 或 --subdomain 参数中的至少一个")
+        parser.print_help()
+        exit(1)
+    
     client = TunnelClient(
-        args.server, 
-        args.server_port, 
-        args.local, 
-        args.local_port, 
-        args.tunnel_id, 
+        args.server,
+        args.server_port,
+        args.local,
+        args.local_port,
+        args.tunnel_id,
+        args.subdomain,
         not args.no_ssl
     )
     
     try:
+        logging.info(f"启动客户端，{'使用子域名 ' + args.subdomain if args.subdomain else ''}，隧道ID: {client.tunnel_id}")
         client.start()
     except KeyboardInterrupt:
         logging.info("正在停止客户端...")

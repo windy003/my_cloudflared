@@ -27,6 +27,7 @@ class TunnelServer:
         self.cert_file = cert_file
         self.key_file = key_file
         self.tunnels = {}  # tunnel_id -> client_socket
+        self.domain_tunnels = {}  # subdomain -> tunnel_id
         self.pending_requests = {}  # request_id -> response_event, response_data
         self.running = False
         
@@ -115,6 +116,12 @@ class TunnelServer:
                                 tunnel_id = json_data.get('tunnel_id')
                                 self.tunnels[tunnel_id] = client_socket
                                 logging.info(f"客户端 {client_address} 成功注册为隧道 {tunnel_id}")
+                                
+                                # 处理子域名
+                                if 'subdomain' in json_data:
+                                    subdomain = json_data.get('subdomain')
+                                    self.register_subdomain(subdomain, tunnel_id)
+                                    logging.info(f"注册子域名 {subdomain} 到隧道 {tunnel_id}")
                             else:
                                 logging.warning(f"初始消息不是注册消息: {json_data.get('type')}")
                         except json.JSONDecodeError as e:
@@ -189,6 +196,12 @@ class TunnelServer:
                 self.tunnels[tunnel_id] = client_socket
                 logging.info(f"客户端 {client_address} 注册为隧道 {tunnel_id}")
                 
+                # 处理子域名注册
+                if "subdomain" in message:
+                    subdomain = message["subdomain"]
+                    self.register_subdomain(subdomain, tunnel_id)
+                    logging.info(f"为隧道 {tunnel_id} 注册子域名 {subdomain}")
+                
                 # 发送确认消息
                 try:
                     confirmation = {
@@ -246,15 +259,40 @@ class TunnelServer:
                 self.handle_request()
                 
             def handle_request(self):
-                # 从路径中提取隧道ID
-                path_parts = self.path.split('/')
-                if len(path_parts) < 2:
-                    logging.warning(f"请求没有指定隧道ID: {self.path}")
-                    self.send_error(404, "隧道ID未指定")
-                    return
+                # 首先检查Host头部,处理子域名
+                host = self.headers.get('Host', '')
+                logging.info(f"收到请求: Host={host}, Path={self.path}")
                 
-                tunnel_id = path_parts[1]
-                remaining_path = '/' + '/'.join(path_parts[2:])
+                # 解析子域名
+                subdomain = None
+                if '.' in host:
+                    parts = host.split('.')
+                    if len(parts) >= 2:  # 支持 p.windy.run 格式
+                        subdomain = parts[0]
+                        logging.info(f"解析到子域名: {subdomain}")
+                
+                # 在日志中输出当前所有子域名映射，用于调试
+                logging.info(f"当前子域名映射: {tunnel_server.domain_tunnels}")
+                
+                # 如果存在子域名映射,直接使用对应的隧道ID
+                if subdomain and subdomain in tunnel_server.domain_tunnels:
+                    tunnel_id = tunnel_server.domain_tunnels[subdomain]
+                    logging.info(f"通过子域名 {subdomain} 找到隧道 {tunnel_id}")
+                    # 子域名方式访问，路径保持不变
+                    remaining_path = self.path
+                else:
+                    if subdomain:
+                        logging.warning(f"子域名 {subdomain} 没有对应的隧道映射")
+                    
+                    # 传统方式：从路径中提取隧道ID
+                    path_parts = self.path.split('/')
+                    if len(path_parts) < 2 or not path_parts[1]:  # 检查是否为空
+                        logging.warning(f"请求没有指定隧道ID: {self.path}")
+                        self.send_error(404, "隧道ID未指定")
+                        return
+                    
+                    tunnel_id = path_parts[1]
+                    remaining_path = '/' + '/'.join(path_parts[2:])
                 
                 # 检查隧道是否存在
                 if tunnel_id not in tunnel_server.tunnels:
@@ -472,6 +510,13 @@ class TunnelServer:
 
         except Exception as e:
             logging.error(f"发送测试响应错误: {e}")
+
+    # 添加一个新方法用于注册子域名
+    def register_subdomain(self, subdomain, tunnel_id):
+        self.domain_tunnels[subdomain] = tunnel_id
+        logging.info(f"子域名 {subdomain} 已映射到隧道 {tunnel_id}")
+        # 打印当前所有子域名映射，用于调试
+        logging.info(f"当前子域名映射: {self.domain_tunnels}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="内网穿透服务器")
