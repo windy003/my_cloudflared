@@ -1,0 +1,503 @@
+import socket
+import threading
+import json
+import ssl
+import uuid
+import argparse
+import logging
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import time
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("tunnel_server.log"),
+        logging.StreamHandler()
+    ]
+)
+
+class TunnelServer:
+    def __init__(self, bind_host, bind_port, http_port, use_ssl=True, cert_file=None, key_file=None):
+        self.bind_host = bind_host
+        self.bind_port = bind_port
+        self.http_port = http_port
+        self.use_ssl = use_ssl
+        self.cert_file = cert_file
+        self.key_file = key_file
+        self.tunnels = {}  # tunnel_id -> client_socket
+        self.pending_requests = {}  # request_id -> response_event, response_data
+        self.running = False
+        
+    def start(self):
+        self.running = True
+        
+        # 启动控制服务器（接受客户端连接）
+        control_thread = threading.Thread(target=self.run_control_server)
+        control_thread.daemon = True
+        control_thread.start()
+        
+        # 启动HTTP服务器（接受外部请求）
+        self.run_http_server()
+    
+    def run_control_server(self):
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind((self.bind_host, self.bind_port))
+        server_socket.listen(5)
+        
+        logging.info(f"控制服务器运行在 {self.bind_host}:{self.bind_port}")
+        
+        if self.use_ssl:
+            context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            context.load_cert_chain(certfile=self.cert_file, keyfile=self.key_file)
+        
+        while self.running:
+            try:
+                client_socket, client_address = server_socket.accept()
+                logging.info(f"接受来自 {client_address} 的连接")
+                
+                if self.use_ssl:
+                    try:
+                        client_socket = context.wrap_socket(client_socket, server_side=True)
+                    except ssl.SSLError as e:
+                        logging.error(f"SSL握手失败: {e}")
+                        client_socket.close()
+                        continue
+                
+                # 创建新线程处理客户端连接
+                client_thread = threading.Thread(target=self.handle_client_connection, 
+                                              args=(client_socket, client_address))
+                client_thread.daemon = True
+                client_thread.start()
+                
+            except Exception as e:
+                logging.error(f"接受连接错误: {e}")
+    
+    def handle_client_connection(self, client_socket, client_address):
+        tunnel_id = None
+        buffer = b''
+        
+        try:
+            # 设置更长的超时时间
+            client_socket.settimeout(15.0)
+            
+            logging.info(f"等待客户端 {client_address} 的初始数据...")
+            
+            # 接收初始数据
+            try:
+                initial_data = client_socket.recv(4096)  # 增加接收缓冲区大小
+                if not initial_data:
+                    logging.warning(f"客户端 {client_address} 连接后立即关闭")
+                    return
+                
+                logging.info(f"收到客户端 {client_address} 的初始数据: {len(initial_data)} 字节")
+                logging.debug(f"初始数据: {initial_data[:100].hex()}")
+                
+                # 尝试以UTF-8解码
+                try:
+                    decoded_data = initial_data.decode('utf-8')
+                    logging.info(f"解码后的初始数据: {decoded_data.strip()}")
+                    
+                    # 查找消息边界
+                    if '\n' in decoded_data:
+                        message, remaining = decoded_data.split('\n', 1)
+                        buffer = remaining.encode('utf-8')
+                        
+                        # 尝试解析JSON
+                        try:
+                            json_data = json.loads(message)
+                            logging.info(f"解析初始JSON成功: {json_data}")
+                            
+                            # 处理注册消息
+                            if json_data.get('type') == 'register':
+                                tunnel_id = json_data.get('tunnel_id')
+                                self.tunnels[tunnel_id] = client_socket
+                                logging.info(f"客户端 {client_address} 成功注册为隧道 {tunnel_id}")
+                            else:
+                                logging.warning(f"初始消息不是注册消息: {json_data.get('type')}")
+                        except json.JSONDecodeError as e:
+                            logging.error(f"初始JSON解析错误: {e}, 消息内容: {message}")
+                            buffer = initial_data  # 保留原始数据
+                    else:
+                        logging.warning(f"初始数据中没有换行符，无法解析")
+                        buffer = initial_data  # 保留原始数据
+                except UnicodeDecodeError:
+                    logging.error(f"无法解码初始数据为UTF-8，可能不是文本数据")
+                    if initial_data.startswith(b'\x16\x03'):
+                        logging.error(f"检测到SSL/TLS握手，但服务器运行在非SSL模式")
+                    buffer = initial_data  # 保留原始数据
+            except socket.timeout:
+                logging.error(f"等待客户端 {client_address} 初始数据超时")
+                return
+            
+            # 恢复正常超时设置
+            client_socket.settimeout(None)
+            
+            logging.info(f"进入消息处理主循环，当前buffer大小: {len(buffer)} 字节")
+            
+            # 主循环
+            while self.running:
+                try:
+                    data = client_socket.recv(4096)
+                    if not data:
+                        logging.info(f"客户端 {client_address} 连接关闭")
+                        break
+                    
+                    logging.debug(f"收到数据: {len(data)} 字节")
+                    buffer += data
+                    
+                    # 处理可能的多条消息
+                    while b'\n' in buffer:
+                        message, buffer = buffer.split(b'\n', 1)
+                        if message:
+                            try:
+                                # 尝试以UTF-8解码
+                                decoded_message = message.decode('utf-8')
+                                logging.debug(f"处理消息: {decoded_message[:100]}")
+                                self.process_client_message(client_socket, decoded_message, client_address)
+                            except UnicodeDecodeError:
+                                logging.error(f"无法解码消息")
+                                logging.debug(f"消息前20字节: {message[:20].hex()}")
+                except Exception as e:
+                    logging.error(f"接收数据错误: {e}")
+                    break
+        
+        except Exception as e:
+            logging.error(f"处理客户端 {client_address} 错误: {e}", exc_info=True)
+        
+        finally:
+            # 清理
+            if tunnel_id and tunnel_id in self.tunnels:
+                del self.tunnels[tunnel_id]
+                logging.info(f"隧道 {tunnel_id} 已移除")
+            
+            try:
+                client_socket.close()
+            except:
+                pass
+    
+    def process_client_message(self, client_socket, message_str, client_address):
+        try:
+            logging.info(f"处理客户端消息: {message_str}")
+            message = json.loads(message_str)
+            
+            if message["type"] == "register":
+                # 客户端注册
+                tunnel_id = message["tunnel_id"]
+                self.tunnels[tunnel_id] = client_socket
+                logging.info(f"客户端 {client_address} 注册为隧道 {tunnel_id}")
+                
+                # 发送确认消息
+                try:
+                    confirmation = {
+                        "type": "register_confirm",
+                        "tunnel_id": tunnel_id,
+                        "status": "success"
+                    }
+                    client_socket.sendall((json.dumps(confirmation) + '\n').encode('utf-8'))
+                    logging.info(f"已发送注册确认消息给隧道 {tunnel_id}")
+                except Exception as e:
+                    logging.error(f"发送注册确认消息失败: {e}")
+                
+            elif message["type"] == "heartbeat":
+                # 心跳消息
+                logging.debug(f"收到心跳消息")
+                # 可以发送心跳响应
+                try:
+                    response = {"type": "heartbeat_response"}
+                    client_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
+                except:
+                    pass
+                
+            elif message["type"] == "response" or message["type"] == "error":
+                # 处理客户端的响应
+                request_id = message["request_id"]
+                if request_id in self.pending_requests:
+                    event, _ = self.pending_requests[request_id]
+                    self.pending_requests[request_id] = (event, message)
+                    event.set()  # 通知等待线程
+                else:
+                    logging.warning(f"收到未知请求ID的响应: {request_id}")
+            
+            else:
+                logging.warning(f"收到未知类型的消息: {message['type']}")
+        
+        except json.JSONDecodeError:
+            logging.error(f"JSON解析错误: {message_str[:100]}...")
+        except Exception as e:
+            logging.error(f"处理客户端消息错误: {e}")
+    
+    def run_http_server(self):
+        # 创建HTTP服务器来接收外部请求
+        server = self.create_http_server()
+        logging.info(f"HTTP服务器运行在 {self.bind_host}:{self.http_port}")
+        server.serve_forever()
+    
+    def create_http_server(self):
+        tunnel_server = self  # 让处理器可以访问隧道服务器实例
+        
+        class TunnelHttpHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.handle_request()
+                
+            def do_POST(self):
+                self.handle_request()
+                
+            def handle_request(self):
+                # 从路径中提取隧道ID
+                path_parts = self.path.split('/')
+                if len(path_parts) < 2:
+                    logging.warning(f"请求没有指定隧道ID: {self.path}")
+                    self.send_error(404, "隧道ID未指定")
+                    return
+                
+                tunnel_id = path_parts[1]
+                remaining_path = '/' + '/'.join(path_parts[2:])
+                
+                # 检查隧道是否存在
+                if tunnel_id not in tunnel_server.tunnels:
+                    logging.warning(f"请求的隧道不存在: {tunnel_id}")
+                    self.send_error(404, f"隧道 {tunnel_id} 不存在或未连接")
+                    return
+                
+                logging.info(f"处理到隧道 {tunnel_id} 的请求, 路径: {remaining_path}")
+                
+                # 读取请求体
+                content_length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(content_length) if content_length > 0 else b''
+                
+                # 构建要发送给客户端的请求
+                request_data = {
+                    "method": self.command,
+                    "path": remaining_path,
+                    "headers": dict(self.headers),
+                    "body": body.decode() if body else ""
+                }
+                
+                # 发送请求到客户端并等待响应
+                response = tunnel_server.forward_request_to_client(tunnel_id, request_data)
+                if not response:
+                    logging.error(f"无法从内网服务获取响应")
+                    self.send_error(502, "无法从内网服务获取响应")
+                    return
+                
+                # 处理响应
+                if response["type"] == "error":
+                    error_msg = response.get("error", "内网服务错误")
+                    logging.error(f"收到错误响应: {error_msg}")
+                    self.send_error(502, error_msg)
+                    return
+                
+                # 解析响应内容
+                try:
+                    logging.info(f"收到响应数据，正在解析...")
+                    resp_data = json.loads(response["data"])
+                    status_code = resp_data.get("status", 200)
+                    headers = resp_data.get("headers", {})
+                    body = resp_data.get("body", "")
+                    
+                    # 确保Content-Type指定了字符集
+                    if "Content-Type" in headers and "charset" not in headers["Content-Type"]:
+                        if "text/html" in headers["Content-Type"]:
+                            headers["Content-Type"] = "text/html; charset=utf-8"
+                        elif "text/plain" in headers["Content-Type"]:
+                            headers["Content-Type"] = "text/plain; charset=utf-8"
+                    
+                    # 发送响应
+                    logging.info(f"发送响应: 状态码 {status_code}")
+                    self.send_response(status_code)
+                    for name, value in headers.items():
+                        self.send_header(name, value)
+                    self.end_headers()
+                    
+                    if body:
+                        # 确保以UTF-8编码发送
+                        self.wfile.write(body.encode('utf-8', errors='replace'))
+                        logging.info(f"响应体已发送，长度: {len(body)}")
+                    
+                except Exception as e:
+                    logging.error(f"解析响应数据失败: {e}")
+                    # 如果无法解析JSON，则直接返回原始响应
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(("解析响应失败: " + str(e)).encode('utf-8'))
+            
+            def send_error(self, code, message=None, explain=None):
+                """自定义send_error方法以支持中文"""
+                # 记录错误消息
+                logging.error(f"错误: {message}")
+                
+                # 将非ASCII消息替换为ASCII消息（如果需要）
+                if message and not all(ord(c) < 128 for c in message):
+                    ascii_message = "Error occurred"
+                else:
+                    ascii_message = message
+                
+                # 发送响应头
+                self.send_response(code, ascii_message)
+                self.send_header("Content-Type", "text/html;charset=utf-8")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                
+                # 发送HTML内容
+                content = f"""
+                <!DOCTYPE HTML>
+                <html>
+                    <head>
+                        <meta charset="utf-8">
+                        <title>错误 {code}</title>
+                    </head>
+                    <body>
+                        <h1>错误 {code}</h1>
+                        <p>{message}</p>
+                        <p>{explain if explain else ""}</p>
+                    </body>
+                </html>
+                """
+                
+                self.wfile.write(content.encode('utf-8'))
+            
+            def log_message(self, format, *args):
+                """覆盖日志记录方法，防止IndexError"""
+                try:
+                    if len(args) >= 3:
+                        logging.info(f"HTTP请求: {args[0]} {args[1]} {args[2]}")
+                    else:
+                        logging.info(f"HTTP日志: {format % args if args else format}")
+                except Exception as e:
+                    logging.error(f"日志记录出错: {e}")
+        
+        httpd = HTTPServer((self.bind_host, self.http_port), TunnelHttpHandler)
+        return httpd
+    
+    def forward_request_to_client(self, tunnel_id, request_data):
+        client_socket = self.tunnels.get(tunnel_id)
+        if not client_socket:
+            logging.error(f"找不到隧道 {tunnel_id} 的连接")
+            return None
+        
+        # 生成唯一请求ID
+        request_id = str(uuid.uuid4())
+        
+        # 创建事件对象来等待响应
+        response_event = threading.Event()
+        self.pending_requests[request_id] = (response_event, None)
+        
+        try:
+            # 发送请求到客户端
+            request_msg = {
+                "type": "request",
+                "request_id": request_id,
+                "data": json.dumps(request_data)
+            }
+            
+            logging.info(f"发送请求到客户端 (隧道ID: {tunnel_id}, 请求ID: {request_id})")
+            client_socket.sendall(json.dumps(request_msg).encode() + b'\n')
+            
+            # 等待响应，超时30秒
+            if response_event.wait(30):
+                logging.info(f"收到响应事件通知 (请求ID: {request_id})")
+                _, response = self.pending_requests.pop(request_id)
+                logging.info(f"收到客户端响应 (请求ID: {request_id}, 类型: {response.get('type')})")
+                return response
+            else:
+                # 超时
+                logging.warning(f"等待客户端响应超时 (请求ID: {request_id})")
+                self.pending_requests.pop(request_id, None)
+                return None
+                
+        except Exception as e:
+            logging.error(f"转发请求错误: {e}")
+            self.pending_requests.pop(request_id, None)
+            return None
+    
+    def stop(self):
+        self.running = False
+        logging.info("正在停止服务器...")
+
+    def send_test_response(self, request_id):
+        """发送测试响应"""
+        try:
+            logging.info(f"发送测试响应: {request_id}")
+            response_data = {
+                "status": 200,
+                "headers": {"Content-Type": "text/html; charset=utf-8"},  # 明确指定UTF-8编码
+                "body": f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta charset="utf-8">  <!-- 添加此行确保HTML正确解析UTF-8 -->
+                    <title>隧道测试</title>
+                    <style>
+                        body {{
+                            font-family: Arial, sans-serif;
+                            margin: 40px;
+                            line-height: 1.6;
+                        }}
+                        .container {{
+                            max-width: 800px;
+                            margin: 0 auto;
+                            padding: 20px;
+                            border: 1px solid #ddd;
+                            border-radius: 5px;
+                        }}
+                        h1 {{
+                            color: #2c3e50;
+                        }}
+                        .success {{
+                            color: #27ae60;
+                            font-weight: bold;
+                        }}
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <h1>内网穿透测试</h1>
+                        <p class="success">✅ 隧道工作正常!</p>
+                        <p>请求ID: {request_id}</p>
+                        <p>隧道ID: {self.tunnel_id}</p>
+                        <p>时间: {time.strftime('%Y-%m-%d %H:%M:%S')}</p>
+                        <hr>
+                        <p>服务器: {self.server_host}:{self.server_port}</p>
+                        <p>本地服务: {self.local_host}:{self.local_port}</p>
+                    </div>
+                </body>
+                </html>
+                """
+            }
+            
+
+        except Exception as e:
+            logging.error(f"发送测试响应错误: {e}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="内网穿透服务器")
+    parser.add_argument("--host", default="0.0.0.0", help="绑定地址")
+    parser.add_argument("--control-port", type=int, default=8000, help="控制服务器端口")
+    parser.add_argument("--http-port", type=int, default=80, help="HTTP服务器端口")
+    parser.add_argument("--no-ssl", action="store_true", help="禁用SSL")
+    parser.add_argument("--cert", help="SSL证书文件")
+    parser.add_argument("--key", help="SSL密钥文件")
+    
+    args = parser.parse_args()
+    
+    # 如果启用SSL，则需要提供证书和密钥文件
+    if not args.no_ssl and (not args.cert or not args.key):
+        parser.error("启用SSL时需要提供--cert和--key参数")
+    
+    server = TunnelServer(
+        args.host,
+        args.control_port,
+        args.http_port,
+        not args.no_ssl,
+        args.cert,
+        args.key
+    )
+    
+    try:
+        server.start()
+    except KeyboardInterrupt:
+        server.stop()
