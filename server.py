@@ -1,3 +1,7 @@
+# 运行的命令:
+#  python3 server.py --control-port 8000 --http-port 80 --no-ssl
+
+
 import socket
 import threading
 import json
@@ -307,11 +311,20 @@ class TunnelServer:
                 body = self.rfile.read(content_length) if content_length > 0 else b''
                 
                 # 构建要发送给客户端的请求
+                headers = dict(self.headers)
+                
+                # 修正Content-Length，确保与实际body长度匹配
+                if body:
+                    headers['Content-Length'] = str(len(body))
+                elif 'Content-Length' in headers:
+                    # 如果没有body但有Content-Length，删除这个头部
+                    del headers['Content-Length']
+                
                 request_data = {
                     "method": self.command,
                     "path": remaining_path,
-                    "headers": dict(self.headers),
-                    "body": body.decode() if body else ""
+                    "headers": headers,  # 使用修正后的headers
+                    "body": body.decode('utf-8', errors='replace') if body else ""
                 }
                 
                 # 发送请求到客户端并等待响应

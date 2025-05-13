@@ -1,3 +1,7 @@
+# 运行的命令
+#  python client.py --server 144.202.26.208 --server-port 8000 --local 127.0.0.1 --local-port 5008 --subdomain p
+
+
 import socket
 import threading
 import json
@@ -202,21 +206,32 @@ class TunnelClient:
                 
                 # 添加原始请求的头部
                 for name, value in headers.items():
-                    if name.lower() not in ['host', 'connection']:
+                    if name.lower() not in ['host', 'connection', 'content-length']:  # 排除这些头
                         request_str += f"{name}: {value}\r\n"
                 
                 request_str += "Connection: close\r\n"
                 
+                # 正确设置Content-Length
                 if body:
-                    request_str += f"Content-Length: {len(body)}\r\n"
+                    body_bytes = body.encode('utf-8') if isinstance(body, str) else body
+                    request_str += f"Content-Length: {len(body_bytes)}\r\n"
                 
                 request_str += "\r\n"
+                
                 if body:
-                    request_str += body
+                    # 确保body是字节类型
+                    if isinstance(body, str):
+                        request_str += body
+                    else:
+                        # 先发送头部
+                        local_socket.sendall(request_str.encode('utf-8'))
+                        # 然后单独发送body
+                        local_socket.sendall(body)
+                        request_str = ""  # 清空，避免重复发送
                 
                 # 发送请求到本地服务
-                logging.info(f"发送请求到本地服务")
-                local_socket.sendall(request_str.encode())
+                if request_str:  # 如果还有内容需要发送
+                    local_socket.sendall(request_str.encode('utf-8'))
                 
                 # 接收响应
                 logging.info(f"等待本地服务响应")
