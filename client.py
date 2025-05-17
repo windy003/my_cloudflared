@@ -17,7 +17,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("tunnel_client.log"),
+        logging.FileHandler("tunnel_client.log", mode='w'),
         logging.StreamHandler()
     ]
 )
