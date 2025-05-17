@@ -37,8 +37,7 @@ class TunnelClient:
         self.use_ssl = use_ssl
         self.running = False
         self.control_socket = None
-        self.reconnect_delay = 5  # 初始重连延迟，单位秒
-        self.max_reconnect_delay = 60  # 最大重连延迟
+        self.reconnect_delay = 10  # 固定重连延迟为10秒
         
     def start(self):
         self.running = True
@@ -120,10 +119,9 @@ class TunnelClient:
                         pass
                     self.control_socket = None
                 
-                # 等待后重试
+                # 固定等待10秒后重试
                 logging.info(f"将在 {self.reconnect_delay} 秒后重试连接")
                 time.sleep(self.reconnect_delay)
-                self.reconnect_delay = min(self.reconnect_delay * 1.5, self.max_reconnect_delay)
     
     def send_message(self, message):
         """安全地发送消息到服务器"""
