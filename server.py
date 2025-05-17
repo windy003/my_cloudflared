@@ -49,6 +49,10 @@ class TunnelServer:
     def run_control_server(self):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+        server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+        server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6)
         server_socket.bind((self.bind_host, self.bind_port))
         server_socket.listen(5)
         
@@ -70,6 +74,12 @@ class TunnelServer:
                         logging.error(f"SSL握手失败: {e}")
                         client_socket.close()
                         continue
+                
+                # 设置客户端套接字的保活选项
+                client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+                client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6)
                 
                 # 创建新线程处理客户端连接
                 client_thread = threading.Thread(target=self.handle_client_connection, 
@@ -217,6 +227,9 @@ class TunnelServer:
                     logging.info(f"已发送注册确认消息给隧道 {tunnel_id}")
                 except Exception as e:
                     logging.error(f"发送注册确认消息失败: {e}")
+                
+                # 启动心跳线程
+                self.start_heartbeat(client_socket, tunnel_id)
                 
             elif message["type"] == "heartbeat":
                 # 心跳消息
@@ -530,6 +543,23 @@ class TunnelServer:
         logging.info(f"子域名 {subdomain} 已映射到隧道 {tunnel_id}")
         # 打印当前所有子域名映射，用于调试
         logging.info(f"当前子域名映射: {self.domain_tunnels}")
+
+    # 添加一个定期发送心跳的方法
+    def start_heartbeat(self, client_socket, tunnel_id):
+        def send_heartbeat():
+            while tunnel_id in self.tunnels and self.running:
+                try:
+                    heartbeat_msg = {"type": "heartbeat"}
+                    client_socket.sendall((json.dumps(heartbeat_msg) + '\n').encode('utf-8'))
+                    logging.debug(f"向隧道 {tunnel_id} 发送心跳")
+                    time.sleep(30)  # 每30秒发送一次心跳
+                except Exception as e:
+                    logging.error(f"发送心跳失败: {e}")
+                    break
+        
+        heartbeat_thread = threading.Thread(target=send_heartbeat)
+        heartbeat_thread.daemon = True
+        heartbeat_thread.start()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="内网穿透服务器")

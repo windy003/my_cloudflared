@@ -56,6 +56,11 @@ class TunnelClient:
                 try:
                     # 尝试连接
                     sock.connect((self.server_host, self.server_port))
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6)
+                    
                     logging.info(f"成功连接到服务器")
                     
                     # 连接成功后重置超时设置
@@ -93,6 +98,9 @@ class TunnelClient:
                     
                     # 主循环 - 处理服务器发来的请求
                     self.handle_server_messages()
+                    
+                    # 在 connect_to_server 方法中，连接成功后启动心跳线程
+                    self.start_heartbeat()
                     
                 except socket.error as e:
                     logging.error(f"连接错误: {e}")
@@ -156,6 +164,7 @@ class TunnelClient:
         try:
             logging.debug(f"处理消息: {message_str[:100]}...")
             message = json.loads(message_str)
+            
             if message["type"] == "request":
                 # 启动新线程处理请求
                 logging.info(f"收到请求: {message['request_id']}")
@@ -163,6 +172,14 @@ class TunnelClient:
                     target=self.handle_request, 
                     args=(message["request_id"], message["data"])
                 ).start()
+            elif message["type"] == "heartbeat":
+                # 收到服务器心跳，回应一个心跳
+                logging.debug("收到服务器心跳")
+                response = {"type": "heartbeat_response"}
+                self.send_message(response)
+            elif message["type"] == "heartbeat_response":
+                # 收到服务器对心跳的响应
+                logging.debug("收到服务器心跳响应")
             else:
                 logging.warning(f"收到未知类型的消息: {message['type']}")
         except json.JSONDecodeError:
@@ -197,7 +214,7 @@ class TunnelClient:
                 # 连接到本地服务
                 logging.info(f"连接本地服务 {self.local_host}:{self.local_port}")
                 local_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                local_socket.settimeout(90)  # 将10秒修改为30秒
+                local_socket.settimeout(90)  # 将10秒修改为90秒
                 local_socket.connect((self.local_host, self.local_port))
                 
                 # 构建HTTP请求
@@ -422,6 +439,23 @@ class TunnelClient:
                 self.control_socket.close()
             except:
                 pass
+
+    def start_heartbeat(self):
+        def send_heartbeat():
+            while self.running and self.control_socket:
+                try:
+                    heartbeat = {"type": "heartbeat"}
+                    heartbeat_json = json.dumps(heartbeat) + '\n'
+                    self.control_socket.sendall(heartbeat_json.encode('utf-8'))
+                    logging.debug("发送心跳消息")
+                    time.sleep(30)  # 每30秒发送一次
+                except Exception as e:
+                    logging.error(f"发送心跳失败: {e}")
+                    break
+        
+        heartbeat_thread = threading.Thread(target=send_heartbeat)
+        heartbeat_thread.daemon = True
+        heartbeat_thread.start()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="内网穿透客户端")
