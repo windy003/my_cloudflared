@@ -197,7 +197,7 @@ class TunnelClient:
                 # 连接到本地服务
                 logging.info(f"连接本地服务 {self.local_host}:{self.local_port}")
                 local_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                local_socket.settimeout(10)  # 10秒超时
+                local_socket.settimeout(90)  # 将10秒修改为30秒
                 local_socket.connect((self.local_host, self.local_port))
                 
                 # 构建HTTP请求

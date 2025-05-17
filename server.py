@@ -448,8 +448,8 @@ class TunnelServer:
             logging.info(f"发送请求到客户端 (隧道ID: {tunnel_id}, 请求ID: {request_id})")
             client_socket.sendall(json.dumps(request_msg).encode() + b'\n')
             
-            # 等待响应，超时30秒
-            if response_event.wait(30):
+            # 等待响应，超时60秒
+            if response_event.wait(90):
                 logging.info(f"收到响应事件通知 (请求ID: {request_id})")
                 _, response = self.pending_requests.pop(request_id)
                 logging.info(f"收到客户端响应 (请求ID: {request_id}, 类型: {response.get('type')})")
