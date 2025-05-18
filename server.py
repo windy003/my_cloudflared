@@ -266,7 +266,7 @@ class TunnelServer:
         server.serve_forever()
     
     def create_http_server(self):
-        tunnel_server = self  # 让处理器可以访问隧道服务器实例
+        tunnel_server = self
         
         class TunnelHttpHandler(BaseHTTPRequestHandler):
             def do_GET(self):
@@ -435,6 +435,14 @@ class TunnelServer:
                     logging.error(f"日志记录出错: {e}")
         
         httpd = HTTPServer((self.bind_host, self.http_port), TunnelHttpHandler)
+        
+        # 添加HTTPS支持
+        if self.use_ssl and self.cert_file and self.key_file:
+            context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            context.load_cert_chain(certfile=self.cert_file, keyfile=self.key_file)
+            httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+            logging.info(f"HTTPS服务器运行在 {self.bind_host}:{self.http_port}")
+        
         return httpd
     
     def forward_request_to_client(self, tunnel_id, request_data):

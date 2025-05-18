@@ -53,6 +53,14 @@ class TunnelClient:
                 sock.settimeout(10)  # 10秒连接超时
                 
                 try:
+                    # 创建SSL上下文
+                    context = ssl.create_default_context()
+                    # 如果使用自签名证书，需要禁用证书验证
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                    # 包装为SSL连接
+                    sock = context.wrap_socket(sock, server_hostname=self.server_host)
+                    
                     # 尝试连接
                     sock.connect((self.server_host, self.server_port))
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
