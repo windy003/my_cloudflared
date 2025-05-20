@@ -55,9 +55,10 @@ class TunnelClient:
                 try:
                     # 创建SSL上下文
                     context = ssl.create_default_context()
-                    # 如果使用自签名证书，需要禁用证书验证
                     context.check_hostname = False
                     context.verify_mode = ssl.CERT_NONE
+                    context.minimum_version = ssl.TLSVersion.TLSv1_2  # 设置最低支持的TLS版本
+                    context.maximum_version = ssl.TLSVersion.TLSv1_3  # 设置最高支持的TLS版本
                     # 包装为SSL连接
                     sock = context.wrap_socket(sock, server_hostname=self.server_host)
                     

@@ -1,5 +1,7 @@
 # 运行的命令:
+# 有ssl
 #  python3 server.py --control-port 8000 --http-port 80 --no-ssl
+# 无ssl
 # sudo python3 server.py --control-port 8000 --http-port 443 --cert /etc/letsencrypt/live/windy.run/fullchain.pem --key  /etc/letsencrypt/live/windy.run/privkey.pem
 
 
