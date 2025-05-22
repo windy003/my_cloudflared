@@ -15,6 +15,7 @@ import argparse
 import logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import time
+import os
 
 # 配置日志
 logging.basicConfig(
@@ -39,8 +40,27 @@ class TunnelServer:
         self.pending_requests = {}  # request_id -> response_event, response_data
         self.running = False
         
+    def check_port_available(self, port):
+        """检查端口是否可用"""
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind((self.bind_host, port))
+            s.close()
+            return True
+        except:
+            return False
+
     def start(self):
         self.running = True
+        
+        # 检查端口可用性
+        if not self.check_port_available(self.http_port):
+            logging.error(f"HTTP端口 {self.http_port} 已被占用，无法启动服务器")
+            os.system(f"fuser -k {self.http_port}/tcp")
+            time.sleep(5)
+            if not self.check_port_available(self.http_port):
+                logging.error("无法释放端口，服务器启动失败")
+                return
         
         # 启动控制服务器（接受客户端连接）
         control_thread = threading.Thread(target=self.run_control_server)
@@ -48,7 +68,16 @@ class TunnelServer:
         control_thread.start()
         
         # 启动HTTP服务器（接受外部请求）
-        self.run_http_server()
+        http_thread = threading.Thread(target=self.run_http_server)
+        http_thread.daemon = True
+        http_thread.start()
+        
+        # 主线程保持运行
+        try:
+            while self.running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.stop()
     
     def run_control_server(self):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -264,10 +293,23 @@ class TunnelServer:
             logging.error(f"处理客户端消息错误: {e}")
     
     def run_http_server(self):
-        # 创建HTTP服务器来接收外部请求
-        server = self.create_http_server()
-        logging.info(f"HTTP服务器运行在 {self.bind_host}:{self.http_port}")
-        server.serve_forever()
+        try:
+            # 创建HTTP服务器来接收外部请求
+            server = self.create_http_server()
+            logging.info(f"HTTP服务器运行在 {self.bind_host}:{self.http_port}")
+            server.serve_forever()
+        except OSError as e:
+            if e.errno == 98:  # 地址已被使用
+                logging.error(f"HTTP端口 {self.http_port} 已被占用，尝试释放...")
+                # 尝试终止占用端口的进程
+                os.system(f"fuser -k {self.http_port}/tcp")
+                time.sleep(10)  # 等待端口释放
+            logging.error(f"HTTP服务器发生错误: {e}", exc_info=True)
+            if self.running:
+                # 尝试重启HTTP服务器
+                logging.info("尝试重启HTTP服务器...")
+                time.sleep(5)
+                self.run_http_server()
     
     def create_http_server(self):
         tunnel_server = self
@@ -439,6 +481,7 @@ class TunnelServer:
                     logging.error(f"日志记录出错: {e}")
         
         httpd = HTTPServer((self.bind_host, self.http_port), TunnelHttpHandler)
+        httpd.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         
         # 添加HTTPS支持
         if self.use_ssl and self.cert_file and self.key_file:
