@@ -39,6 +39,8 @@ class TunnelServer:
         self.domain_tunnels = {}  # subdomain -> tunnel_id
         self.pending_requests = {}  # request_id -> response_event, response_data
         self.running = False
+        self.client_last_seen = {}  # 记录客户端最后活跃时间
+        self.heartbeat_timeout = 90  # 心跳超时时间（秒）
         
     def check_port_available(self, port):
         """检查端口是否可用"""
@@ -60,7 +62,10 @@ class TunnelServer:
             time.sleep(5)
             if not self.check_port_available(self.http_port):
                 logging.error("无法释放端口，服务器启动失败")
-                return
+                return False
+        
+        # 添加这一行 - 启动连接监控
+        self.start_connection_monitor()
         
         # 启动控制服务器（接受客户端连接）
         control_thread = threading.Thread(target=self.run_control_server)
@@ -237,10 +242,16 @@ class TunnelServer:
             logging.info(f"处理客户端消息: {message_str}")
             message = json.loads(message_str)
             
+            # 更新客户端最后活跃时间
+            if "tunnel_id" in message:
+                tunnel_id = message["tunnel_id"]
+                self.client_last_seen[tunnel_id] = time.time()
+            
             if message["type"] == "register":
                 # 客户端注册
                 tunnel_id = message["tunnel_id"]
                 self.tunnels[tunnel_id] = client_socket
+                self.client_last_seen[tunnel_id] = time.time()  # 记录注册时间
                 logging.info(f"客户端 {client_address} 注册为隧道 {tunnel_id}")
                 
                 # 处理子域名注册
@@ -265,14 +276,17 @@ class TunnelServer:
                 self.start_heartbeat(client_socket, tunnel_id)
                 
             elif message["type"] == "heartbeat":
-                # 心跳消息
-                logging.debug(f"收到心跳消息")
-                # 可以发送心跳响应
+                # 心跳消息 - 更新活跃时间
+                tunnel_id = message.get("tunnel_id", "unknown")
+                self.client_last_seen[tunnel_id] = time.time()
+                logging.debug(f"收到隧道 {tunnel_id} 的心跳消息")
+                
+                # 发送心跳响应
                 try:
-                    response = {"type": "heartbeat_response"}
+                    response = {"type": "heartbeat_response", "timestamp": time.time()}
                     client_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
-                except:
-                    pass
+                except Exception as e:
+                    logging.error(f"发送心跳响应失败: {e}")
                 
             elif message["type"] == "response" or message["type"] == "error":
                 # 处理客户端的响应
@@ -498,6 +512,15 @@ class TunnelServer:
             logging.error(f"找不到隧道 {tunnel_id} 的连接")
             return None
         
+        # 添加这个连接检查
+        try:
+            # 发送一个小的测试包
+            client_socket.sendall(b'')  # 空数据包测试连接
+        except:
+            logging.error(f"隧道 {tunnel_id} 连接已断开，清理中...")
+            self.cleanup_tunnel(tunnel_id)
+            return None
+        
         # 生成唯一请求ID
         request_id = str(uuid.uuid4())
         
@@ -615,6 +638,60 @@ class TunnelServer:
         heartbeat_thread = threading.Thread(target=send_heartbeat)
         heartbeat_thread.daemon = True
         heartbeat_thread.start()
+
+    def start_connection_monitor(self):
+        """启动连接监控线程，定期清理僵尸连接"""
+        def monitor_connections():
+            while self.running:
+                try:
+                    current_time = time.time()
+                    dead_tunnels = []
+                    
+                    for tunnel_id, client_socket in list(self.tunnels.items()):
+                        last_seen = self.client_last_seen.get(tunnel_id, current_time)
+                        if current_time - last_seen > self.heartbeat_timeout:
+                            logging.warning(f"隧道 {tunnel_id} 心跳超时，准备清理")
+                            dead_tunnels.append(tunnel_id)
+                            
+                            # 尝试发送测试消息检查连接
+                            try:
+                                test_msg = {"type": "ping"}
+                                client_socket.sendall((json.dumps(test_msg) + '\n').encode('utf-8'))
+                            except:
+                                # 发送失败，确认连接已断开
+                                pass
+                    
+                    # 清理僵尸连接
+                    for tunnel_id in dead_tunnels:
+                        self.cleanup_tunnel(tunnel_id)
+                        
+                    time.sleep(30)  # 每30秒检查一次
+                except Exception as e:
+                    logging.error(f"连接监控错误: {e}")
+                    time.sleep(30)
+        
+        monitor_thread = threading.Thread(target=monitor_connections)
+        monitor_thread.daemon = True
+        monitor_thread.start()
+
+    def cleanup_tunnel(self, tunnel_id):
+        """清理指定的隧道连接"""
+        if tunnel_id in self.tunnels:
+            try:
+                self.tunnels[tunnel_id].close()
+            except:
+                pass
+            del self.tunnels[tunnel_id]
+            logging.info(f"已清理僵尸隧道: {tunnel_id}")
+        
+        if tunnel_id in self.client_last_seen:
+            del self.client_last_seen[tunnel_id]
+        
+        # 清理子域名映射
+        for subdomain, tid in list(self.domain_tunnels.items()):
+            if tid == tunnel_id:
+                del self.domain_tunnels[subdomain]
+                logging.info(f"已清理子域名映射: {subdomain} -> {tunnel_id}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="内网穿透服务器")
