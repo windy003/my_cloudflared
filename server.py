@@ -659,6 +659,28 @@ class TunnelServer:
         heartbeat_thread.daemon = True
         heartbeat_thread.start()
 
+    def format_time_duration(self, seconds):
+        """将秒数转换为天、小时、分钟、秒的格式"""
+        if seconds < 0:
+            return "0秒"
+        
+        days = int(seconds // 86400)
+        hours = int((seconds % 86400) // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        
+        parts = []
+        if days > 0:
+            parts.append(f"{days}天")
+        if hours > 0:
+            parts.append(f"{hours}小时")
+        if minutes > 0:
+            parts.append(f"{minutes}分钟")
+        if secs > 0 or not parts:  # 如果没有其他部分，至少显示秒
+            parts.append(f"{secs}秒")
+        
+        return "".join(parts)
+
     def start_connection_monitor(self):
         def monitor_connections():
             while self.running:
@@ -670,10 +692,18 @@ class TunnelServer:
                     # 列出所有活跃隧道
                     if connection_count > 0:
                         tunnel_info = []
+                        current_time = time.time()
                         for tunnel_id in self.tunnels:
-                            last_seen = self.client_last_seen.get(tunnel_id, 0)
-                            idle_time = time.time() - last_seen
-                            tunnel_info.append(f"{tunnel_id}(空闲{idle_time:.1f}秒)")
+                            last_seen = self.client_last_seen.get(tunnel_id, current_time)
+                            idle_time = current_time - last_seen
+                            # 如果空闲时间为负数或过大（超过1年），说明数据有问题
+                            if idle_time < 0 or idle_time > 365 * 24 * 3600:
+                                formatted_time = "未知"
+                                # 重新设置为当前时间
+                                self.client_last_seen[tunnel_id] = current_time
+                            else:
+                                formatted_time = self.format_time_duration(idle_time)
+                            tunnel_info.append(f"{tunnel_id}(空闲{formatted_time})")
                         logging.info(f"活跃隧道: {', '.join(tunnel_info)}")
                     
                     # 检查系统资源
