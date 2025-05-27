@@ -41,6 +41,7 @@ class TunnelServer:
         self.running = False
         self.client_last_seen = {}  # 记录客户端最后活跃时间
         self.heartbeat_timeout = 90  # 心跳超时时间（秒）
+        self.current_connections = 0  # 改为实例变量
         
     def check_port_available(self, port):
         """检查端口是否可用"""
@@ -100,10 +101,27 @@ class TunnelServer:
             context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
             context.load_cert_chain(certfile=self.cert_file, keyfile=self.key_file)
         
+        # 添加连接计数和限制
+        max_connections = 100  # 最大同时处理的连接数
+        
+        def _handle_client_connection_wrapper(client_socket, client_address):
+            try:
+                self.handle_client_connection(client_socket, client_address)
+            finally:
+                self.current_connections -= 1
+        
         while self.running:
             try:
+                # 如果当前连接数达到上限，等待一段时间再接受新连接
+                if self.current_connections >= max_connections:
+                    time.sleep(1)
+                    continue
+                
                 client_socket, client_address = server_socket.accept()
-                logging.info(f"接受来自 {client_address} 的连接")
+                logging.info(f"接受来自 {client_address} 的连接 (当前连接数: {self.current_connections+1}/{max_connections})")
+                
+                # 增加当前连接计数
+                self.current_connections += 1
                 
                 if self.use_ssl:
                     try:
@@ -119,9 +137,11 @@ class TunnelServer:
                 client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
                 client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6)
                 
-                # 创建新线程处理客户端连接
-                client_thread = threading.Thread(target=self.handle_client_connection, 
-                                              args=(client_socket, client_address))
+                # 创建新线程处理客户端连接，并传入连接计数的引用
+                client_thread = threading.Thread(
+                    target=_handle_client_connection_wrapper, 
+                    args=(client_socket, client_address)
+                )
                 client_thread.daemon = True
                 client_thread.start()
                 
@@ -133,63 +153,63 @@ class TunnelServer:
         buffer = b''
         
         try:
-            # 设置更长的超时时间
             client_socket.settimeout(15.0)
             
             logging.info(f"等待客户端 {client_address} 的初始数据...")
             
-            # 接收初始数据
-            try:
-                initial_data = client_socket.recv(4096)  # 增加接收缓冲区大小
-                if not initial_data:
-                    logging.warning(f"客户端 {client_address} 连接后立即关闭")
-                    return
-                
-                logging.info(f"收到客户端 {client_address} 的初始数据: {len(initial_data)} 字节")
-                logging.debug(f"初始数据: {initial_data[:100].hex()}")
-                
-                # 尝试以UTF-8解码
-                try:
-                    decoded_data = initial_data.decode('utf-8')
-                    logging.info(f"解码后的初始数据: {decoded_data.strip()}")
-                    
-                    # 查找消息边界
-                    if '\n' in decoded_data:
-                        message, remaining = decoded_data.split('\n', 1)
-                        buffer = remaining.encode('utf-8')
-                        
-                        # 尝试解析JSON
-                        try:
-                            json_data = json.loads(message)
-                            logging.info(f"解析初始JSON成功: {json_data}")
-                            
-                            # 处理注册消息
-                            if json_data.get('type') == 'register':
-                                tunnel_id = json_data.get('tunnel_id')
-                                self.tunnels[tunnel_id] = client_socket
-                                logging.info(f"客户端 {client_address} 成功注册为隧道 {tunnel_id}")
-                                
-                                # 处理子域名
-                                if 'subdomain' in json_data:
-                                    subdomain = json_data.get('subdomain')
-                                    self.register_subdomain(subdomain, tunnel_id)
-                                    logging.info(f"注册子域名 {subdomain} 到隧道 {tunnel_id}")
-                            else:
-                                logging.warning(f"初始消息不是注册消息: {json_data.get('type')}")
-                        except json.JSONDecodeError as e:
-                            logging.error(f"初始JSON解析错误: {e}, 消息内容: {message}")
-                            buffer = initial_data  # 保留原始数据
-                    else:
-                        logging.warning(f"初始数据中没有换行符，无法解析")
-                        buffer = initial_data  # 保留原始数据
-                except UnicodeDecodeError:
-                    logging.error(f"无法解码初始数据为UTF-8，可能不是文本数据")
-                    if initial_data.startswith(b'\x16\x03'):
-                        logging.error(f"检测到SSL/TLS握手，但服务器运行在非SSL模式")
-                    buffer = initial_data  # 保留原始数据
-            except socket.timeout:
-                logging.error(f"等待客户端 {client_address} 初始数据超时")
+            initial_data = client_socket.recv(4096)
+            if not initial_data:
+                logging.warning(f"客户端 {client_address} 连接后立即关闭")
                 return
+            
+            # 快速识别HTTP请求并关闭连接
+            if initial_data.startswith(b'GET ') or initial_data.startswith(b'POST ') or initial_data.startswith(b'HEAD '):
+                logging.warning(f"检测到HTTP请求，不是合法的控制连接: {client_address}")
+                client_socket.close()
+                return
+            
+            logging.info(f"收到客户端 {client_address} 的初始数据: {len(initial_data)} 字节")
+            logging.debug(f"初始数据: {initial_data[:100].hex()}")
+            
+            # 尝试以UTF-8解码
+            try:
+                decoded_data = initial_data.decode('utf-8')
+                logging.info(f"解码后的初始数据: {decoded_data.strip()}")
+                
+                # 查找消息边界
+                if '\n' in decoded_data:
+                    message, remaining = decoded_data.split('\n', 1)
+                    buffer = remaining.encode('utf-8')
+                    
+                    # 尝试解析JSON
+                    try:
+                        json_data = json.loads(message)
+                        logging.info(f"解析初始JSON成功: {json_data}")
+                        
+                        # 处理注册消息
+                        if json_data.get('type') == 'register':
+                            tunnel_id = json_data.get('tunnel_id')
+                            self.tunnels[tunnel_id] = client_socket
+                            logging.info(f"客户端 {client_address} 成功注册为隧道 {tunnel_id}")
+                            
+                            # 处理子域名
+                            if 'subdomain' in json_data:
+                                subdomain = json_data.get('subdomain')
+                                self.register_subdomain(subdomain, tunnel_id)
+                                logging.info(f"注册子域名 {subdomain} 到隧道 {tunnel_id}")
+                        else:
+                            logging.warning(f"初始消息不是注册消息: {json_data.get('type')}")
+                    except json.JSONDecodeError as e:
+                        logging.error(f"初始JSON解析错误: {e}, 消息内容: {message}")
+                        buffer = initial_data  # 保留原始数据
+                else:
+                    logging.warning(f"初始数据中没有换行符，无法解析")
+                    buffer = initial_data  # 保留原始数据
+            except UnicodeDecodeError:
+                logging.error(f"无法解码初始数据为UTF-8，可能不是文本数据")
+                if initial_data.startswith(b'\x16\x03'):
+                    logging.error(f"检测到SSL/TLS握手，但服务器运行在非SSL模式")
+                buffer = initial_data  # 保留原始数据
             
             # 恢复正常超时设置
             client_socket.settimeout(None)
@@ -640,35 +660,33 @@ class TunnelServer:
         heartbeat_thread.start()
 
     def start_connection_monitor(self):
-        """启动连接监控线程，定期清理僵尸连接"""
         def monitor_connections():
             while self.running:
                 try:
-                    current_time = time.time()
-                    dead_tunnels = []
+                    # 统计当前连接数
+                    connection_count = len(self.tunnels)
+                    logging.info(f"当前活跃隧道数: {connection_count}")
                     
-                    for tunnel_id, client_socket in list(self.tunnels.items()):
-                        last_seen = self.client_last_seen.get(tunnel_id, current_time)
-                        if current_time - last_seen > self.heartbeat_timeout:
-                            logging.warning(f"隧道 {tunnel_id} 心跳超时，准备清理")
-                            dead_tunnels.append(tunnel_id)
-                            
-                            # 尝试发送测试消息检查连接
-                            try:
-                                test_msg = {"type": "ping"}
-                                client_socket.sendall((json.dumps(test_msg) + '\n').encode('utf-8'))
-                            except:
-                                # 发送失败，确认连接已断开
-                                pass
+                    # 列出所有活跃隧道
+                    if connection_count > 0:
+                        tunnel_info = []
+                        for tunnel_id in self.tunnels:
+                            last_seen = self.client_last_seen.get(tunnel_id, 0)
+                            idle_time = time.time() - last_seen
+                            tunnel_info.append(f"{tunnel_id}(空闲{idle_time:.1f}秒)")
+                        logging.info(f"活跃隧道: {', '.join(tunnel_info)}")
                     
-                    # 清理僵尸连接
-                    for tunnel_id in dead_tunnels:
-                        self.cleanup_tunnel(tunnel_id)
-                        
-                    time.sleep(30)  # 每30秒检查一次
+                    # 检查系统资源
+                    import os, psutil
+                    process = psutil.Process(os.getpid())
+                    mem_info = process.memory_info()
+                    logging.info(f"内存使用: {mem_info.rss / 1024 / 1024:.1f} MB")
+                    
+                    # 其余代码...
+                    time.sleep(60)  # 每分钟记录一次
                 except Exception as e:
-                    logging.error(f"连接监控错误: {e}")
-                    time.sleep(30)
+                    logging.error(f"监控错误: {e}")
+                    time.sleep(60)
         
         monitor_thread = threading.Thread(target=monitor_connections)
         monitor_thread.daemon = True
