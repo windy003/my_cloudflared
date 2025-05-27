@@ -151,9 +151,18 @@ class TunnelServer:
     def handle_client_connection(self, client_socket, client_address):
         tunnel_id = None
         buffer = b''
+        last_activity = time.time()
         
         try:
-            client_socket.settimeout(15.0)
+            # 设置更合理的超时时间
+            client_socket.settimeout(30.0)
+            
+            # 添加连接活跃度跟踪
+            def update_activity():
+                nonlocal last_activity
+                last_activity = time.time()
+                if tunnel_id:
+                    self.client_last_seen[tunnel_id] = last_activity
             
             logging.info(f"等待客户端 {client_address} 的初始数据...")
             
@@ -217,12 +226,13 @@ class TunnelServer:
             logging.info(f"进入消息处理主循环，当前buffer大小: {len(buffer)} 字节")
             
             # 主循环
-            while self.running:
+            while self.running and tunnel_id in self.tunnels:
                 try:
                     data = client_socket.recv(4096)
                     if not data:
-                        logging.info(f"客户端 {client_address} 连接关闭")
                         break
+                    
+                    update_activity()  # 更新活跃时间
                     
                     logging.debug(f"收到数据: {len(data)} 字节")
                     buffer += data
@@ -239,23 +249,23 @@ class TunnelServer:
                             except UnicodeDecodeError:
                                 logging.error(f"无法解码消息")
                                 logging.debug(f"消息前20字节: {message[:20].hex()}")
+                except socket.timeout:
+                    # 检查是否长时间无活动
+                    if time.time() - last_activity > 120:  # 2分钟无活动
+                        logging.warning(f"客户端 {tunnel_id} 长时间无活动，断开连接")
+                        break
+                    continue
                 except Exception as e:
                     logging.error(f"接收数据错误: {e}")
                     break
         
         except Exception as e:
-            logging.error(f"处理客户端 {client_address} 错误: {e}", exc_info=True)
+            logging.error(f"处理客户端连接错误: {e}")
         
         finally:
-            # 清理
-            if tunnel_id and tunnel_id in self.tunnels:
-                del self.tunnels[tunnel_id]
-                logging.info(f"隧道 {tunnel_id} 已移除")
-            
-            try:
-                client_socket.close()
-            except:
-                pass
+            # 清理连接
+            if tunnel_id:
+                self.cleanup_tunnel(tunnel_id)
     
     def process_client_message(self, client_socket, message_str, client_address):
         try:

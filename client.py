@@ -38,7 +38,10 @@ class TunnelClient:
         self.use_ssl = use_ssl
         self.running = False
         self.control_socket = None
-        self.reconnect_delay = 10  # 固定重连延迟为10秒
+        self.reconnect_delay = 5  # 初始重连延迟改为5秒
+        self.max_reconnect_delay = 300  # 最大重连延迟5分钟
+        self.reconnect_attempts = 0  # 重连尝试次数
+        self.max_reconnect_attempts = 10  # 最大连续重连尝试次数
         
     def start(self):
         self.running = True
@@ -51,7 +54,18 @@ class TunnelClient:
                 logging.info(f"正在连接到服务器 {self.server_host}:{self.server_port}...")
                 
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(10)  # 10秒连接超时
+                
+                # 设置socket选项提高稳定性
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                
+                # Windows特定的keepalive设置
+                if hasattr(socket, 'TCP_KEEPIDLE'):
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                
+                sock.settimeout(15)  # 增加连接超时时间到15秒
                 
                 try:
                     # 创建SSL上下文
@@ -111,6 +125,10 @@ class TunnelClient:
                     # 在 connect_to_server 方法中，连接成功后启动心跳线程
                     self.start_heartbeat()
                     
+                    # 连接成功，重置重连参数
+                    self.reconnect_delay = 5
+                    self.reconnect_attempts = 0
+                    
                 except socket.error as e:
                     logging.error(f"连接错误: {e}")
                     if self.control_socket:
@@ -119,8 +137,19 @@ class TunnelClient:
                     sock.close()
                     
             except Exception as e:
-                logging.error(f"连接过程错误: {e}", exc_info=True)
+                logging.error(f"连接过程错误: {e}")
+                self.reconnect_attempts += 1
                 
+                # 指数退避算法
+                if self.reconnect_attempts <= self.max_reconnect_attempts:
+                    current_delay = min(self.reconnect_delay * (2 ** (self.reconnect_attempts - 1)), self.max_reconnect_delay)
+                    logging.info(f"第 {self.reconnect_attempts} 次重连失败，将在 {current_delay} 秒后重试")
+                    time.sleep(current_delay)
+                else:
+                    logging.error(f"连续重连失败 {self.max_reconnect_attempts} 次，等待 {self.max_reconnect_delay} 秒后重置")
+                    time.sleep(self.max_reconnect_delay)
+                    self.reconnect_attempts = 0
+            
             finally:
                 if self.control_socket:
                     try:
@@ -128,10 +157,6 @@ class TunnelClient:
                     except:
                         pass
                     self.control_socket = None
-                
-                # 固定等待10秒后重试
-                logging.info(f"将在 {self.reconnect_delay} 秒后重试连接")
-                time.sleep(self.reconnect_delay)
     
     def send_message(self, message):
         """安全地发送消息到服务器"""
@@ -148,13 +173,26 @@ class TunnelClient:
     
     def handle_server_messages(self):
         buffer = b''
+        last_health_check = time.time()
+        health_check_interval = 60  # 每60秒检查一次连接健康状态
         
         while self.running:
             try:
+                # 设置接收超时
+                self.control_socket.settimeout(30)
                 data = self.control_socket.recv(4096)
+                
                 if not data:
-                    logging.info("服务器连接已关闭")
+                    logging.warning("服务器连接已关闭")
                     break
+                
+                # 定期健康检查
+                current_time = time.time()
+                if current_time - last_health_check > health_check_interval:
+                    if not self.check_connection_health():
+                        logging.warning("连接健康检查失败，准备重连")
+                        break
+                    last_health_check = current_time
                 
                 buffer += data
                 
@@ -164,6 +202,10 @@ class TunnelClient:
                     if message:
                         self.process_message(message.decode('utf-8'))
                         
+            except socket.timeout:
+                # 超时不一定是错误，继续循环
+                logging.debug("接收数据超时，继续等待")
+                continue
             except Exception as e:
                 logging.error(f"接收消息错误: {e}")
                 break
@@ -450,13 +492,20 @@ class TunnelClient:
 
     def start_heartbeat(self):
         def send_heartbeat():
+            heartbeat_interval = 20  # 改为20秒发送一次心跳
+            last_heartbeat_time = time.time()
+            
             while self.running and self.control_socket:
                 try:
-                    heartbeat = {"type": "heartbeat"}
-                    heartbeat_json = json.dumps(heartbeat) + '\n'
-                    self.control_socket.sendall(heartbeat_json.encode('utf-8'))
-                    logging.debug("发送心跳消息")
-                    time.sleep(30)  # 每30秒发送一次
+                    current_time = time.time()
+                    if current_time - last_heartbeat_time >= heartbeat_interval:
+                        heartbeat = {"type": "heartbeat", "timestamp": current_time}
+                        heartbeat_json = json.dumps(heartbeat) + '\n'
+                        self.control_socket.sendall(heartbeat_json.encode('utf-8'))
+                        logging.debug("发送心跳消息")
+                        last_heartbeat_time = current_time
+                    
+                    time.sleep(5)  # 每5秒检查一次
                 except Exception as e:
                     logging.error(f"发送心跳失败: {e}")
                     break
@@ -464,6 +513,20 @@ class TunnelClient:
         heartbeat_thread = threading.Thread(target=send_heartbeat)
         heartbeat_thread.daemon = True
         heartbeat_thread.start()
+
+    def check_connection_health(self):
+        """检查连接健康状态"""
+        if not self.control_socket:
+            return False
+        
+        try:
+            # 发送一个简单的ping消息
+            ping_msg = {"type": "ping", "timestamp": time.time()}
+            ping_json = json.dumps(ping_msg) + '\n'
+            self.control_socket.sendall(ping_json.encode('utf-8'))
+            return True
+        except:
+            return False
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="内网穿透客户端")
