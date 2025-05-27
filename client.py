@@ -160,25 +160,34 @@ class TunnelClient:
     
     def send_message(self, message):
         """安全地发送消息到服务器"""
-        try:
-            message_json = json.dumps(message)
-            if not message_json.endswith('\n'):
-                message_json += '\n'
-            
-            self.control_socket.sendall(message_json.encode('utf-8'))
-            return True
-        except Exception as e:
-            logging.error(f"发送消息错误: {e}")
-            return False
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if not self.control_socket:
+                    logging.error("控制连接不存在")
+                    return False
+                
+                message_json = json.dumps(message)
+                if not message_json.endswith('\n'):
+                    message_json += '\n'
+                
+                self.control_socket.sendall(message_json.encode('utf-8'))
+                return True
+            except Exception as e:
+                logging.error(f"发送消息错误 (尝试 {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)  # 短暂等待后重试
+                else:
+                    # 最后一次尝试失败，标记连接需要重建
+                    self.running = False
+                    return False
     
     def handle_server_messages(self):
         buffer = b''
-        last_health_check = time.time()
-        health_check_interval = 60  # 每60秒检查一次连接健康状态
         
         while self.running:
             try:
-                # 设置接收超时
+                # 设置接收超时为30秒
                 self.control_socket.settimeout(30)
                 data = self.control_socket.recv(4096)
                 
@@ -186,21 +195,18 @@ class TunnelClient:
                     logging.warning("服务器连接已关闭")
                     break
                 
-                # 定期健康检查
-                current_time = time.time()
-                if current_time - last_health_check > health_check_interval:
-                    if not self.check_connection_health():
-                        logging.warning("连接健康检查失败，准备重连")
-                        break
-                    last_health_check = current_time
-                
                 buffer += data
                 
                 # 处理可能的多条消息
                 while b'\n' in buffer:
                     message, buffer = buffer.split(b'\n', 1)
                     if message:
-                        self.process_message(message.decode('utf-8'))
+                        try:
+                            self.process_message(message.decode('utf-8'))
+                        except Exception as e:
+                            logging.error(f"处理单条消息错误: {e}")
+                            # 不要因为单条消息处理错误就断开连接
+                            continue
                         
             except socket.timeout:
                 # 超时不一定是错误，继续循环
@@ -238,14 +244,13 @@ class TunnelClient:
             logging.error(f"处理消息错误: {e}", exc_info=True)
     
     def handle_request(self, request_id, data):
+        local_socket = None
         try:
             # 确保data是字典类型
             if isinstance(data, str):
                 try:
-                    # 尝试将字符串解析为JSON
                     data = json.loads(data)
                 except json.JSONDecodeError:
-                    # 如果无法解析为JSON，创建一个基本的请求数据
                     data = {
                         "method": "GET",
                         "path": "/",
@@ -253,95 +258,91 @@ class TunnelClient:
                         "body": ""
                     }
             
-            # 现在解析请求数据
             method = data.get('method', 'GET')
             path = data.get('path', '/')
             headers = data.get('headers', {})
             body = data.get('body', '')
             
-            # 以下是实际连接本地服务的代码
-            try:
-                # 连接到本地服务
-                logging.info(f"连接本地服务 {self.local_host}:{self.local_port}")
-                local_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                local_socket.settimeout(90)  # 将10秒修改为90秒
-                local_socket.connect((self.local_host, self.local_port))
-                
-                # 构建HTTP请求
-                request_str = f"{method} {path} HTTP/1.1\r\n"
-                request_str += f"Host: {self.local_host}:{self.local_port}\r\n"
-                
-                # 添加原始请求的头部
-                for name, value in headers.items():
-                    if name.lower() not in ['host', 'connection', 'content-length']:  # 排除这些头
-                        request_str += f"{name}: {value}\r\n"
-                
-                request_str += "Connection: close\r\n"
-                
-                # 正确设置Content-Length
-                if body:
-                    body_bytes = body.encode('utf-8') if isinstance(body, str) else body
-                    request_str += f"Content-Length: {len(body_bytes)}\r\n"
-                
-                request_str += "\r\n"
-                
-                if body:
-                    # 确保body是字节类型
-                    if isinstance(body, str):
-                        request_str += body
-                    else:
-                        # 先发送头部
-                        local_socket.sendall(request_str.encode('utf-8'))
-                        # 然后单独发送body
-                        local_socket.sendall(body)
-                        request_str = ""  # 清空，避免重复发送
-                
-                # 发送请求到本地服务
-                if request_str:  # 如果还有内容需要发送
-                    local_socket.sendall(request_str.encode('utf-8'))
-                
-                # 接收响应
-                logging.info(f"等待本地服务响应")
-                response = b""
-                while True:
-                    try:
-                        chunk = local_socket.recv(4096)
-                        if not chunk:
-                            break
-                        response += chunk
-                    except socket.timeout:
-                        logging.warning("读取本地服务响应超时")
-                        break
-                
-                local_socket.close()
-                
-                if not response:
-                    logging.warning("本地服务没有返回响应")
-                    self.send_error_response(request_id, "本地服务没有返回响应")
-                    return
-                
-                # 解析HTTP响应
-                try:
-                    http_response = self.parse_http_response(response)
-                    # 发送响应
-                    self.send_success_response(request_id, http_response)
-                except Exception as e:
-                    logging.error(f"解析HTTP响应错误: {e}")
-                    # 直接发送原始响应
-                    response_data = {
-                        "status": 200,
-                        "headers": {"Content-Type": "text/plain"},
-                        "body": response.decode('utf-8', errors='replace')
-                    }
-                    self.send_success_response(request_id, response_data)
-                
-            except socket.error as e:
-                logging.error(f"连接本地服务错误: {e}")
-                self.send_error_response(request_id, f"连接本地服务错误: {str(e)}")
+            # 连接到本地服务
+            logging.info(f"连接本地服务 {self.local_host}:{self.local_port}")
+            local_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            local_socket.settimeout(30)  # 减少超时时间到30秒
+            local_socket.connect((self.local_host, self.local_port))
             
+            # 构建HTTP请求
+            request_str = f"{method} {path} HTTP/1.1\r\n"
+            request_str += f"Host: {self.local_host}:{self.local_port}\r\n"
+            
+            # 添加原始请求的头部
+            for name, value in headers.items():
+                if name.lower() not in ['host', 'connection', 'content-length']:
+                    request_str += f"{name}: {value}\r\n"
+            
+            request_str += "Connection: close\r\n"
+            
+            # 正确设置Content-Length
+            if body:
+                body_bytes = body.encode('utf-8') if isinstance(body, str) else body
+                request_str += f"Content-Length: {len(body_bytes)}\r\n"
+            
+            request_str += "\r\n"
+            
+            if body:
+                if isinstance(body, str):
+                    request_str += body
+                else:
+                    local_socket.sendall(request_str.encode('utf-8'))
+                    local_socket.sendall(body)
+                    request_str = ""
+            
+            # 发送请求到本地服务
+            if request_str:
+                local_socket.sendall(request_str.encode('utf-8'))
+            
+            # 接收响应
+            logging.info(f"等待本地服务响应")
+            response = b""
+            while True:
+                try:
+                    chunk = local_socket.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+                except socket.timeout:
+                    logging.warning("读取本地服务响应超时")
+                    break
+            
+            if not response:
+                logging.warning("本地服务没有返回响应")
+                self.send_error_response(request_id, "本地服务没有返回响应")
+                return
+            
+            # 解析HTTP响应
+            try:
+                http_response = self.parse_http_response(response)
+                self.send_success_response(request_id, http_response)
+            except Exception as e:
+                logging.error(f"解析HTTP响应错误: {e}")
+                response_data = {
+                    "status": 200,
+                    "headers": {"Content-Type": "text/plain"},
+                    "body": response.decode('utf-8', errors='replace')
+                }
+                self.send_success_response(request_id, response_data)
+            
+        except socket.error as e:
+            logging.error(f"连接本地服务错误: {e}")
+            self.send_error_response(request_id, f"连接本地服务错误: {str(e)}")
         except Exception as e:
             logging.error(f"处理请求 {request_id} 错误: {e}", exc_info=True)
             self.send_error_response(request_id, str(e))
+        finally:
+            # 确保本地socket被正确关闭
+            if local_socket:
+                try:
+                    local_socket.close()
+                except:
+                    pass
     
     def send_test_response(self, request_id):
         """发送测试响应"""

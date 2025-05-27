@@ -269,22 +269,21 @@ class TunnelServer:
     
     def process_client_message(self, client_socket, message_str, client_address):
         try:
-            logging.info(f"处理客户端消息: {message_str}")
+            logging.debug(f"处理客户端消息: {message_str[:100]}...")
             message = json.loads(message_str)
             
             # 更新客户端最后活跃时间
+            tunnel_id = None
             if "tunnel_id" in message:
                 tunnel_id = message["tunnel_id"]
                 self.client_last_seen[tunnel_id] = time.time()
             
             if message["type"] == "register":
-                # 客户端注册
                 tunnel_id = message["tunnel_id"]
                 self.tunnels[tunnel_id] = client_socket
-                self.client_last_seen[tunnel_id] = time.time()  # 记录注册时间
+                self.client_last_seen[tunnel_id] = time.time()
                 logging.info(f"客户端 {client_address} 注册为隧道 {tunnel_id}")
                 
-                # 处理子域名注册
                 if "subdomain" in message:
                     subdomain = message["subdomain"]
                     self.register_subdomain(subdomain, tunnel_id)
@@ -306,10 +305,16 @@ class TunnelServer:
                 self.start_heartbeat(client_socket, tunnel_id)
                 
             elif message["type"] == "heartbeat":
-                # 心跳消息 - 更新活跃时间
-                tunnel_id = message.get("tunnel_id", "unknown")
-                self.client_last_seen[tunnel_id] = time.time()
-                logging.debug(f"收到隧道 {tunnel_id} 的心跳消息")
+                # 从消息中获取tunnel_id，如果没有则尝试从连接映射中查找
+                if not tunnel_id:
+                    for tid, sock in self.tunnels.items():
+                        if sock == client_socket:
+                            tunnel_id = tid
+                            break
+                
+                if tunnel_id:
+                    self.client_last_seen[tunnel_id] = time.time()
+                    logging.debug(f"收到隧道 {tunnel_id} 的心跳消息")
                 
                 # 发送心跳响应
                 try:
@@ -319,12 +324,11 @@ class TunnelServer:
                     logging.error(f"发送心跳响应失败: {e}")
                 
             elif message["type"] == "response" or message["type"] == "error":
-                # 处理客户端的响应
                 request_id = message["request_id"]
                 if request_id in self.pending_requests:
                     event, _ = self.pending_requests[request_id]
                     self.pending_requests[request_id] = (event, message)
-                    event.set()  # 通知等待线程
+                    event.set()
                 else:
                     logging.warning(f"收到未知请求ID的响应: {request_id}")
             
@@ -542,15 +546,6 @@ class TunnelServer:
             logging.error(f"找不到隧道 {tunnel_id} 的连接")
             return None
         
-        # 添加这个连接检查
-        try:
-            # 发送一个小的测试包
-            client_socket.sendall(b'')  # 空数据包测试连接
-        except:
-            logging.error(f"隧道 {tunnel_id} 连接已断开，清理中...")
-            self.cleanup_tunnel(tunnel_id)
-            return None
-        
         # 生成唯一请求ID
         request_id = str(uuid.uuid4())
         
@@ -567,14 +562,19 @@ class TunnelServer:
             }
             
             logging.info(f"发送请求到客户端 (隧道ID: {tunnel_id}, 请求ID: {request_id})")
-            client_socket.sendall(json.dumps(request_msg).encode() + b'\n')
+            message_json = json.dumps(request_msg) + '\n'
+            client_socket.sendall(message_json.encode('utf-8'))
             
             # 等待响应，超时60秒
-            if response_event.wait(90):
+            if response_event.wait(60):
                 logging.info(f"收到响应事件通知 (请求ID: {request_id})")
-                _, response = self.pending_requests.pop(request_id)
-                logging.info(f"收到客户端响应 (请求ID: {request_id}, 类型: {response.get('type')})")
-                return response
+                _, response = self.pending_requests.pop(request_id, (None, None))
+                if response:
+                    logging.info(f"收到客户端响应 (请求ID: {request_id}, 类型: {response.get('type')})")
+                    return response
+                else:
+                    logging.warning(f"响应数据为空 (请求ID: {request_id})")
+                    return None
             else:
                 # 超时
                 logging.warning(f"等待客户端响应超时 (请求ID: {request_id})")
@@ -584,6 +584,8 @@ class TunnelServer:
         except Exception as e:
             logging.error(f"转发请求错误: {e}")
             self.pending_requests.pop(request_id, None)
+            # 连接出错时清理隧道
+            self.cleanup_tunnel(tunnel_id)
             return None
     
     def stop(self):
