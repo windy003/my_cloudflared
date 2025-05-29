@@ -566,7 +566,7 @@ class TunnelServer:
             client_socket.sendall(message_json.encode('utf-8'))
             
             # 等待响应，超时60秒
-            if response_event.wait(60):
+            if response_event.wait(300):
                 logging.info(f"收到响应事件通知 (请求ID: {request_id})")
                 _, response = self.pending_requests.pop(request_id, (None, None))
                 if response:
