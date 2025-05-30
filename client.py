@@ -242,6 +242,14 @@ class TunnelClient:
             elif message["type"] == "heartbeat_response":
                 # 收到服务器对心跳的响应
                 logging.debug("收到服务器心跳响应")
+            elif message["type"] == "ping":
+                # 收到服务器ping检测消息，回应一个pong
+                logging.debug("收到服务器ping检测消息")
+                response = {"type": "pong", "timestamp": time.time()}
+                self.send_message(response)
+            elif message["type"] == "pong":
+                # 收到服务器对ping的响应
+                logging.debug("收到服务器pong响应")
             else:
                 logging.warning(f"收到未知类型的消息: {message['type']}")
         except json.JSONDecodeError:

@@ -330,6 +330,18 @@ class TunnelServer:
                 except Exception as e:
                     logging.error(f"发送心跳响应失败: {e}")
                 
+            elif message["type"] == "pong":
+                # 收到客户端对ping的响应
+                if not tunnel_id:
+                    for tid, sock in self.tunnels.items():
+                        if sock == client_socket:
+                            tunnel_id = tid
+                            break
+                
+                if tunnel_id:
+                    self.client_last_seen[tunnel_id] = time.time()
+                    logging.debug(f"收到隧道 {tunnel_id} 的pong响应")
+                
             elif message["type"] == "response" or message["type"] == "error":
                 request_id = message["request_id"]
                 if request_id in self.pending_requests:
@@ -719,27 +731,22 @@ class TunnelServer:
                                 client_socket.sendall((json.dumps(ping_msg) + '\n').encode('utf-8'))
                                 logging.info(f"向隧道 {tunnel_id} 发送ping检测消息")
                                 
-                                # 设置短暂超时来检测响应
-                                client_socket.settimeout(5.0)
-                                try:
-                                    # 尝试接收数据来验证连接
-                                    data = client_socket.recv(1, socket.MSG_PEEK)
-                                    if not data:
-                                        dead_tunnels.append(tunnel_id)
-                                        logging.warning(f"检测到僵尸隧道: {tunnel_id} (无数据)")
-                                except socket.timeout:
-                                    # 超时也认为是僵尸连接
+                                # 等待一小段时间让客户端响应
+                                time.sleep(2)
+                                
+                                # 检查是否有响应（通过检查最后活跃时间是否更新）
+                                new_last_seen = self.client_last_seen.get(tunnel_id, last_seen)
+                                if new_last_seen <= last_seen:
+                                    # 没有收到响应，可能是僵尸连接
                                     dead_tunnels.append(tunnel_id)
-                                    logging.warning(f"检测到僵尸隧道: {tunnel_id} (超时)")
-                                except:
-                                    dead_tunnels.append(tunnel_id)
-                                    logging.warning(f"检测到僵尸隧道: {tunnel_id} (异常)")
-                                finally:
-                                    client_socket.settimeout(None)
-                            except:
+                                    logging.warning(f"检测到僵尸隧道: {tunnel_id} (ping无响应)")
+                                else:
+                                    logging.debug(f"隧道 {tunnel_id} ping检测正常")
+                                    
+                            except Exception as e:
                                 # 发送失败，标记为死连接
                                 dead_tunnels.append(tunnel_id)
-                                logging.warning(f"检测到僵尸隧道: {tunnel_id} (发送失败)")
+                                logging.warning(f"检测到僵尸隧道: {tunnel_id} (ping发送失败: {e})")
                     
                     # 清理死连接
                     for tunnel_id in dead_tunnels:
