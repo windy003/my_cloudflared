@@ -50,6 +50,12 @@ class TunnelClient:
     def connect_to_server(self):
         while self.running:
             try:
+                # 重连时生成新的隧道ID（保留子域名）
+                if self.reconnect_attempts > 0:
+                    base_id = self.subdomain if self.subdomain else "tunnel"
+                    self.tunnel_id = f"{base_id}_{int(time.time())}"
+                    logging.info(f"重连使用新隧道ID: {self.tunnel_id}")
+                
                 # 创建到服务器的控制连接
                 logging.info(f"正在连接到服务器 {self.server_host}:{self.server_port}...")
                 

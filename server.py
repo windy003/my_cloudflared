@@ -280,6 +280,13 @@ class TunnelServer:
             
             if message["type"] == "register":
                 tunnel_id = message["tunnel_id"]
+                
+                # 如果隧道已存在，先清理旧连接
+                if tunnel_id in self.tunnels:
+                    logging.warning(f"隧道 {tunnel_id} 已存在，清理旧连接")
+                    self.cleanup_tunnel(tunnel_id)
+                
+                # 注册新连接
                 self.tunnels[tunnel_id] = client_socket
                 self.client_last_seen[tunnel_id] = time.time()
                 logging.info(f"客户端 {client_address} 注册为隧道 {tunnel_id}")
@@ -697,6 +704,28 @@ class TunnelServer:
         def monitor_connections():
             while self.running:
                 try:
+                    current_time = time.time()
+                    dead_tunnels = []
+                    
+                    for tunnel_id, client_socket in list(self.tunnels.items()):
+                        last_seen = self.client_last_seen.get(tunnel_id, current_time)
+                        idle_time = current_time - last_seen
+                        
+                        # 如果超过5分钟没有活动，检查连接是否还活着
+                        if idle_time > 300:  # 5分钟
+                            try:
+                                # 尝试发送一个测试消息
+                                test_msg = {"type": "ping"}
+                                client_socket.sendall((json.dumps(test_msg) + '\n').encode('utf-8'))
+                            except:
+                                # 发送失败，标记为死连接
+                                dead_tunnels.append(tunnel_id)
+                                logging.warning(f"检测到僵尸隧道: {tunnel_id}")
+                    
+                    # 清理死连接
+                    for tunnel_id in dead_tunnels:
+                        self.cleanup_tunnel(tunnel_id)
+                    
                     # 统计当前连接数
                     connection_count = len(self.tunnels)
                     logging.info(f"当前活跃隧道数: {connection_count}")
@@ -704,7 +733,6 @@ class TunnelServer:
                     # 列出所有活跃隧道
                     if connection_count > 0:
                         tunnel_info = []
-                        current_time = time.time()
                         for tunnel_id in self.tunnels:
                             last_seen = self.client_last_seen.get(tunnel_id, current_time)
                             idle_time = current_time - last_seen
