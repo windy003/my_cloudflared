@@ -711,20 +711,40 @@ class TunnelServer:
                         last_seen = self.client_last_seen.get(tunnel_id, current_time)
                         idle_time = current_time - last_seen
                         
-                        # 如果超过5分钟没有活动，检查连接是否还活着
-                        if idle_time > 300:  # 5分钟
+                        # 如果超过3分钟没有活动，主动检测连接状态
+                        if idle_time > 180:  # 3分钟
                             try:
-                                # 尝试发送一个测试消息
-                                test_msg = {"type": "ping"}
-                                client_socket.sendall((json.dumps(test_msg) + '\n').encode('utf-8'))
+                                # 尝试发送一个ping消息来检测连接
+                                ping_msg = {"type": "ping", "timestamp": current_time}
+                                client_socket.sendall((json.dumps(ping_msg) + '\n').encode('utf-8'))
+                                logging.info(f"向隧道 {tunnel_id} 发送ping检测消息")
+                                
+                                # 设置短暂超时来检测响应
+                                client_socket.settimeout(5.0)
+                                try:
+                                    # 尝试接收数据来验证连接
+                                    data = client_socket.recv(1, socket.MSG_PEEK)
+                                    if not data:
+                                        dead_tunnels.append(tunnel_id)
+                                        logging.warning(f"检测到僵尸隧道: {tunnel_id} (无数据)")
+                                except socket.timeout:
+                                    # 超时也认为是僵尸连接
+                                    dead_tunnels.append(tunnel_id)
+                                    logging.warning(f"检测到僵尸隧道: {tunnel_id} (超时)")
+                                except:
+                                    dead_tunnels.append(tunnel_id)
+                                    logging.warning(f"检测到僵尸隧道: {tunnel_id} (异常)")
+                                finally:
+                                    client_socket.settimeout(None)
                             except:
                                 # 发送失败，标记为死连接
                                 dead_tunnels.append(tunnel_id)
-                                logging.warning(f"检测到僵尸隧道: {tunnel_id}")
+                                logging.warning(f"检测到僵尸隧道: {tunnel_id} (发送失败)")
                     
                     # 清理死连接
                     for tunnel_id in dead_tunnels:
                         self.cleanup_tunnel(tunnel_id)
+                        logging.info(f"已清理僵尸隧道: {tunnel_id}")
                     
                     # 统计当前连接数
                     connection_count = len(self.tunnels)
@@ -736,10 +756,8 @@ class TunnelServer:
                         for tunnel_id in self.tunnels:
                             last_seen = self.client_last_seen.get(tunnel_id, current_time)
                             idle_time = current_time - last_seen
-                            # 如果空闲时间为负数或过大（超过1年），说明数据有问题
                             if idle_time < 0 or idle_time > 365 * 24 * 3600:
                                 formatted_time = "未知"
-                                # 重新设置为当前时间
                                 self.client_last_seen[tunnel_id] = current_time
                             else:
                                 formatted_time = self.format_time_duration(idle_time)
@@ -752,8 +770,7 @@ class TunnelServer:
                     mem_info = process.memory_info()
                     logging.info(f"内存使用: {mem_info.rss / 1024 / 1024:.1f} MB")
                     
-                    # 其余代码...
-                    time.sleep(60)  # 每分钟记录一次
+                    time.sleep(60)  # 每分钟检查一次
                 except Exception as e:
                     logging.error(f"监控错误: {e}")
                     time.sleep(60)
