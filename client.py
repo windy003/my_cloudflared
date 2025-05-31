@@ -224,38 +224,63 @@ class TunnelClient:
     
     def process_message(self, message_str):
         try:
-            logging.debug(f"处理消息: {message_str[:100]}...")
+            logging.debug(f"处理消息: {message_str.strip()}")
             message = json.loads(message_str)
+            message_type = message.get("type")
             
-            if message["type"] == "request":
+            if message_type == "request":
                 # 启动新线程处理请求
                 logging.info(f"收到请求: {message['request_id']}")
                 threading.Thread(
                     target=self.handle_request, 
                     args=(message["request_id"], message["data"])
                 ).start()
-            elif message["type"] == "heartbeat":
-                # 收到服务器心跳，回应一个心跳
-                logging.debug("收到服务器心跳")
-                response = {"type": "heartbeat_response"}
-                self.send_message(response)
-            elif message["type"] == "heartbeat_response":
-                # 收到服务器对心跳的响应
-                logging.debug("收到服务器心跳响应")
-            elif message["type"] == "ping":
-                # 收到服务器ping检测消息，回应一个pong
-                logging.debug("收到服务器ping检测消息")
-                response = {"type": "pong", "timestamp": time.time()}
-                self.send_message(response)
-            elif message["type"] == "pong":
-                # 收到服务器对ping的响应
-                logging.debug("收到服务器pong响应")
+            elif message_type == "heartbeat":
+                # 处理服务器发送的心跳消息
+                logging.info(f"收到服务器心跳消息，时间戳: {message.get('timestamp', 'N/A')}")
+                # 发送心跳响应
+                heartbeat_response = {
+                    "type": "heartbeat_response",
+                    "timestamp": time.time(),
+                    "original_timestamp": message.get('timestamp')
+                }
+                self.send_message(heartbeat_response)
+                logging.info("发送心跳响应到服务器")
+            elif message_type == "heartbeat_response":
+                # 处理服务器的心跳响应
+                server_time = message.get('server_time', 'N/A')
+                server_timestamp = message.get('timestamp', 'N/A')
+                logging.info(f"收到服务器心跳响应，服务器时间: {server_time}，时间戳: {server_timestamp}")
+            elif message_type == "ping":
+                # 处理服务器的ping消息
+                ping_timestamp = message.get('timestamp', 'N/A')
+                logging.info(f"收到服务器ping消息，时间戳: {ping_timestamp}")
+                # 发送pong响应
+                pong_response = {
+                    "type": "pong",
+                    "timestamp": time.time(),
+                    "original_timestamp": ping_timestamp
+                }
+                self.send_message(pong_response)
+                logging.info(f"发送pong响应到服务器，原始时间戳: {ping_timestamp}")
+            elif message_type == "pong":
+                # 处理服务器的pong响应
+                original_timestamp = message.get('original_timestamp', 'N/A')
+                response_timestamp = message.get('timestamp', 'N/A')
+                if original_timestamp != 'N/A' and response_timestamp != 'N/A':
+                    try:
+                        rtt = float(response_timestamp) - float(original_timestamp)
+                        logging.info(f"收到服务器pong响应，往返时间: {rtt:.3f}秒")
+                    except:
+                        logging.info(f"收到服务器pong响应，原始时间戳: {original_timestamp}")
+                else:
+                    logging.info("收到服务器pong响应")
             else:
-                logging.warning(f"收到未知类型的消息: {message['type']}")
-        except json.JSONDecodeError:
-            logging.error(f"无效的JSON消息: {message_str[:100]}")
+                logging.warning(f"收到未知类型的消息: {message_type}")
+        except json.JSONDecodeError as e:
+            logging.error(f"JSON解析错误: {e}, 消息内容: {message_str}")
         except Exception as e:
-            logging.error(f"处理消息错误: {e}", exc_info=True)
+            logging.error(f"处理消息错误: {e}")
     
     def handle_request(self, request_id, data):
         local_socket = None
@@ -507,23 +532,34 @@ class TunnelClient:
 
     def start_heartbeat(self):
         def send_heartbeat():
-            heartbeat_interval = 20  # 改为20秒发送一次心跳
+            heartbeat_interval = 20  # 20秒发送一次心跳
             last_heartbeat_time = time.time()
+            heartbeat_count = 0
+            
+            logging.info(f"心跳线程启动，间隔: {heartbeat_interval}秒")
             
             while self.running and self.control_socket:
                 try:
                     current_time = time.time()
                     if current_time - last_heartbeat_time >= heartbeat_interval:
-                        heartbeat = {"type": "heartbeat", "timestamp": current_time}
+                        heartbeat_count += 1
+                        heartbeat_timestamp = current_time
+                        heartbeat = {
+                            "type": "heartbeat", 
+                            "timestamp": heartbeat_timestamp,
+                            "count": heartbeat_count
+                        }
                         heartbeat_json = json.dumps(heartbeat) + '\n'
                         self.control_socket.sendall(heartbeat_json.encode('utf-8'))
-                        logging.debug("发送心跳消息")
+                        logging.info(f"发送心跳消息 #{heartbeat_count}，时间戳: {heartbeat_timestamp}")
                         last_heartbeat_time = current_time
                     
                     time.sleep(5)  # 每5秒检查一次
                 except Exception as e:
                     logging.error(f"发送心跳失败: {e}")
                     break
+            
+            logging.info("心跳线程结束")
         
         heartbeat_thread = threading.Thread(target=send_heartbeat)
         heartbeat_thread.daemon = True
@@ -532,15 +568,19 @@ class TunnelClient:
     def check_connection_health(self):
         """检查连接健康状态"""
         if not self.control_socket:
+            logging.warning("连接健康检查失败: 控制socket不存在")
             return False
         
         try:
             # 发送一个简单的ping消息
-            ping_msg = {"type": "ping", "timestamp": time.time()}
+            ping_timestamp = time.time()
+            ping_msg = {"type": "ping", "timestamp": ping_timestamp}
             ping_json = json.dumps(ping_msg) + '\n'
             self.control_socket.sendall(ping_json.encode('utf-8'))
+            logging.info(f"发送连接健康检查ping，时间戳: {ping_timestamp}")
             return True
-        except:
+        except Exception as e:
+            logging.error(f"连接健康检查失败: {e}")
             return False
 
 if __name__ == "__main__":

@@ -269,16 +269,10 @@ class TunnelServer:
     
     def process_client_message(self, client_socket, message_str, client_address):
         try:
-            logging.debug(f"处理客户端消息: {message_str[:100]}...")
             message = json.loads(message_str)
+            message_type = message.get("type")
             
-            # 更新客户端最后活跃时间
-            tunnel_id = None
-            if "tunnel_id" in message:
-                tunnel_id = message["tunnel_id"]
-                self.client_last_seen[tunnel_id] = time.time()
-            
-            if message["type"] == "register":
+            if message_type == "register":
                 tunnel_id = message["tunnel_id"]
                 
                 # 如果隧道已存在，先清理旧连接
@@ -311,38 +305,57 @@ class TunnelServer:
                 # 启动心跳线程
                 self.start_heartbeat(client_socket, tunnel_id)
                 
-            elif message["type"] == "heartbeat":
-                # 从消息中获取tunnel_id，如果没有则尝试从连接映射中查找
-                if not tunnel_id:
-                    for tid, sock in self.tunnels.items():
-                        if sock == client_socket:
-                            tunnel_id = tid
-                            break
+            elif message_type == "heartbeat":
+                # 增加详细的心跳处理日志
+                tunnel_id = None
+                for tid, socket in self.tunnels.items():
+                    if socket == client_socket:
+                        tunnel_id = tid
+                        break
                 
                 if tunnel_id:
+                    logging.info(f"收到隧道 {tunnel_id} 的心跳消息，时间戳: {message.get('timestamp', 'N/A')}")
+                    # 更新最后活跃时间
                     self.client_last_seen[tunnel_id] = time.time()
-                    logging.debug(f"收到隧道 {tunnel_id} 的心跳消息")
+                    
+                    # 发送心跳响应
+                    heartbeat_response = {
+                        "type": "heartbeat_response", 
+                        "timestamp": time.time(),
+                        "server_time": time.strftime('%Y-%m-%d %H:%M:%S')
+                    }
+                    response_json = json.dumps(heartbeat_response) + '\n'
+                    client_socket.sendall(response_json.encode('utf-8'))
+                    logging.info(f"向隧道 {tunnel_id} 发送心跳响应")
+                else:
+                    logging.warning(f"收到未知连接的心跳消息: {client_address}")
                 
-                # 发送心跳响应
-                try:
-                    response = {"type": "heartbeat_response", "timestamp": time.time()}
-                    client_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
-                except Exception as e:
-                    logging.error(f"发送心跳响应失败: {e}")
-                
-            elif message["type"] == "pong":
-                # 收到客户端对ping的响应
-                if not tunnel_id:
-                    for tid, sock in self.tunnels.items():
-                        if sock == client_socket:
-                            tunnel_id = tid
-                            break
+            elif message_type == "ping":
+                # 增加详细的ping处理日志
+                tunnel_id = None
+                for tid, socket in self.tunnels.items():
+                    if socket == client_socket:
+                        tunnel_id = tid
+                        break
                 
                 if tunnel_id:
+                    logging.info(f"收到隧道 {tunnel_id} 的ping消息，时间戳: {message.get('timestamp', 'N/A')}")
+                    # 更新最后活跃时间
                     self.client_last_seen[tunnel_id] = time.time()
-                    logging.debug(f"收到隧道 {tunnel_id} 的pong响应")
+                    
+                    # 发送pong响应
+                    pong_response = {
+                        "type": "pong", 
+                        "timestamp": time.time(),
+                        "original_timestamp": message.get('timestamp')
+                    }
+                    response_json = json.dumps(pong_response) + '\n'
+                    client_socket.sendall(response_json.encode('utf-8'))
+                    logging.info(f"向隧道 {tunnel_id} 发送pong响应")
+                else:
+                    logging.warning(f"收到未知连接的ping消息: {client_address}")
                 
-            elif message["type"] == "response" or message["type"] == "error":
+            elif message_type == "response" or message_type == "error":
                 request_id = message["request_id"]
                 if request_id in self.pending_requests:
                     event, _ = self.pending_requests[request_id]
@@ -727,9 +740,11 @@ class TunnelServer:
                         if idle_time > 180:  # 3分钟
                             try:
                                 # 尝试发送一个ping消息来检测连接
-                                ping_msg = {"type": "ping", "timestamp": current_time}
-                                client_socket.sendall((json.dumps(ping_msg) + '\n').encode('utf-8'))
-                                logging.info(f"向隧道 {tunnel_id} 发送ping检测消息")
+                                ping_timestamp = current_time
+                                ping_msg = {"type": "ping", "timestamp": ping_timestamp}
+                                ping_json = json.dumps(ping_msg) + '\n'
+                                client_socket.sendall(ping_json.encode('utf-8'))
+                                logging.info(f"向隧道 {tunnel_id} 发送ping检测消息，时间戳: {ping_timestamp}")
                                 
                                 # 等待一小段时间让客户端响应
                                 time.sleep(2)
@@ -739,9 +754,9 @@ class TunnelServer:
                                 if new_last_seen <= last_seen:
                                     # 没有收到响应，可能是僵尸连接
                                     dead_tunnels.append(tunnel_id)
-                                    logging.warning(f"检测到僵尸隧道: {tunnel_id} (ping无响应)")
+                                    logging.warning(f"检测到僵尸隧道: {tunnel_id} (ping无响应，发送时间: {ping_timestamp}，最后活跃: {last_seen})")
                                 else:
-                                    logging.debug(f"隧道 {tunnel_id} ping检测正常")
+                                    logging.info(f"隧道 {tunnel_id} ping检测正常，响应时间: {new_last_seen - ping_timestamp:.2f}秒")
                                     
                             except Exception as e:
                                 # 发送失败，标记为死连接
