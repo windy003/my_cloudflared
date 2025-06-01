@@ -305,7 +305,7 @@ class TunnelClient:
             # 连接到本地服务
             logging.info(f"连接本地服务 {self.local_host}:{self.local_port}")
             local_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            local_socket.settimeout(240)  # 减少超时时间到30秒
+            local_socket.settimeout(180)  # 改为180秒(3分钟)连接超时
             local_socket.connect((self.local_host, self.local_port))
             
             # 构建HTTP请求
@@ -334,22 +334,47 @@ class TunnelClient:
                     local_socket.sendall(body)
                     request_str = ""
             
-            # 发送请求到本地服务
+            # 发送请求到本地爬虫服务
             if request_str:
                 local_socket.sendall(request_str.encode('utf-8'))
             
+            # 通知服务器开始爬虫任务
+            self.send_progress_update(request_id, "开始爬虫任务")
+            
             # 接收响应
-            logging.info(f"等待本地服务响应")
+            logging.info(f"等待本地爬虫服务响应")
             response = b""
+            start_time = time.time()
+            last_progress_time = time.time()
+            
             while True:
                 try:
+                    current_time = time.time()
+                    
+                    # 每30秒发送一次进度更新
+                    if current_time - last_progress_time > 30:
+                        elapsed = int(current_time - start_time)
+                        self.send_progress_update(request_id, f"爬虫运行中... 已耗时{elapsed}秒")
+                        last_progress_time = current_time
+                    
+                    local_socket.settimeout(30)
                     chunk = local_socket.recv(4096)
+                    
                     if not chunk:
                         break
                     response += chunk
+                    
                 except socket.timeout:
-                    logging.warning("读取本地服务响应超时")
-                    break
+                    # 检查总时间
+                    if time.time() - start_time > 300:  # 5分钟
+                        logging.warning("爬虫任务超时")
+                        self.send_progress_update(request_id, "爬虫任务超时")
+                        break
+                    continue
+            
+            # 爬虫完成
+            elapsed = int(time.time() - start_time)
+            self.send_progress_update(request_id, f"爬虫任务完成，耗时{elapsed}秒")
             
             if not response:
                 logging.warning("本地服务没有返回响应")
@@ -590,6 +615,21 @@ class TunnelClient:
             pass
         self.connect_to_server()
         logging.info("已重新连接到服务器")
+
+    def send_progress_update(self, request_id, message):
+        """发送爬虫进度更新"""
+        try:
+            progress_msg = {
+                "type": "progress",
+                "request_id": request_id,
+                "message": message,
+                "timestamp": time.time()
+            }
+            
+            self.send_message(progress_msg)
+            logging.info(f"进度更新: {message}")
+        except Exception as e:
+            logging.error(f"发送进度更新失败: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="内网穿透客户端")

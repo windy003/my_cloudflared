@@ -392,6 +392,17 @@ class TunnelServer:
                 else:
                     logging.warning(f"收到未知请求ID的响应: {request_id}")
             
+            elif message_type == "progress":
+                # 处理爬虫进度更新
+                request_id = message.get("request_id")
+                progress_message = message.get("message")
+                timestamp = message.get("timestamp", time.time())
+                
+                logging.info(f"爬虫进度 (请求ID: {request_id}): {progress_message}")
+                
+                # 可以选择将进度信息存储或转发给前端
+                # 这里只是记录日志
+            
             else:
                 logging.warning(f"收到未知类型的消息: {message['type']}")
         
@@ -494,54 +505,61 @@ class TunnelServer:
                     "body": body.decode('utf-8', errors='replace') if body else ""
                 }
                 
+                # 在发送请求前记录开始时间
+                start_time = time.time()
+                logging.info(f"开始爬虫任务 (请求ID: {tunnel_id})")
+                
                 # 发送请求到客户端并等待响应
                 response = tunnel_server.forward_request_to_client(tunnel_id, request_data)
-                if not response:
-                    logging.error(f"无法从内网服务获取响应")
+                
+                if response:
+                    elapsed = time.time() - start_time
+                    logging.info(f"爬虫任务完成 (请求ID: {tunnel_id})，耗时: {elapsed:.1f}秒")
+                    # 处理响应
+                    if response["type"] == "error":
+                        error_msg = response.get("error", "内网服务错误")
+                        logging.error(f"收到错误响应: {error_msg}")
+                        self.send_error(502, error_msg)
+                        return
+                    
+                    # 解析响应内容
+                    try:
+                        logging.info(f"收到响应数据，正在解析...")
+                        resp_data = json.loads(response["data"])
+                        status_code = resp_data.get("status", 200)
+                        headers = resp_data.get("headers", {})
+                        body = resp_data.get("body", "")
+                        
+                        # 确保Content-Type指定了字符集
+                        if "Content-Type" in headers and "charset" not in headers["Content-Type"]:
+                            if "text/html" in headers["Content-Type"]:
+                                headers["Content-Type"] = "text/html; charset=utf-8"
+                            elif "text/plain" in headers["Content-Type"]:
+                                headers["Content-Type"] = "text/plain; charset=utf-8"
+                        
+                        # 发送响应
+                        logging.info(f"发送响应: 状态码 {status_code}")
+                        self.send_response(status_code)
+                        for name, value in headers.items():
+                            self.send_header(name, value)
+                        self.end_headers()
+                        
+                        if body:
+                            # 确保以UTF-8编码发送
+                            self.wfile.write(body.encode('utf-8', errors='replace'))
+                            logging.info(f"响应体已发送，长度: {len(body)}")
+                        
+                    except Exception as e:
+                        logging.error(f"解析响应数据失败: {e}")
+                        # 如果无法解析JSON，则直接返回原始响应
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/plain; charset=utf-8")
+                        self.end_headers()
+                        self.wfile.write(("解析响应失败: " + str(e)).encode('utf-8'))
+                else:
+                    elapsed = time.time() - start_time
+                    logging.warning(f"爬虫任务失败 (请求ID: {tunnel_id})，耗时: {elapsed:.1f}秒")
                     self.send_error(502, "无法从内网服务获取响应")
-                    return
-                
-                # 处理响应
-                if response["type"] == "error":
-                    error_msg = response.get("error", "内网服务错误")
-                    logging.error(f"收到错误响应: {error_msg}")
-                    self.send_error(502, error_msg)
-                    return
-                
-                # 解析响应内容
-                try:
-                    logging.info(f"收到响应数据，正在解析...")
-                    resp_data = json.loads(response["data"])
-                    status_code = resp_data.get("status", 200)
-                    headers = resp_data.get("headers", {})
-                    body = resp_data.get("body", "")
-                    
-                    # 确保Content-Type指定了字符集
-                    if "Content-Type" in headers and "charset" not in headers["Content-Type"]:
-                        if "text/html" in headers["Content-Type"]:
-                            headers["Content-Type"] = "text/html; charset=utf-8"
-                        elif "text/plain" in headers["Content-Type"]:
-                            headers["Content-Type"] = "text/plain; charset=utf-8"
-                    
-                    # 发送响应
-                    logging.info(f"发送响应: 状态码 {status_code}")
-                    self.send_response(status_code)
-                    for name, value in headers.items():
-                        self.send_header(name, value)
-                    self.end_headers()
-                    
-                    if body:
-                        # 确保以UTF-8编码发送
-                        self.wfile.write(body.encode('utf-8', errors='replace'))
-                        logging.info(f"响应体已发送，长度: {len(body)}")
-                    
-                except Exception as e:
-                    logging.error(f"解析响应数据失败: {e}")
-                    # 如果无法解析JSON，则直接返回原始响应
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/plain; charset=utf-8")
-                    self.end_headers()
-                    self.wfile.write(("解析响应失败: " + str(e)).encode('utf-8'))
             
             def send_error(self, code, message=None, explain=None):
                 """自定义send_error方法以支持中文"""
@@ -625,9 +643,10 @@ class TunnelServer:
             message_json = json.dumps(request_msg) + '\n'
             client_socket.sendall(message_json.encode('utf-8'))
             
-            # 等待响应，超时60秒
-            if response_event.wait(300):
-                logging.info(f"收到响应事件通知 (请求ID: {request_id})")
+            # 等待响应，针对爬虫程序延长超时时间
+            logging.info(f"等待客户端爬虫响应 (请求ID: {request_id})，最长等待5分钟")
+            if response_event.wait(300):  # 5分钟超时
+                logging.info(f"收到爬虫响应事件通知 (请求ID: {request_id})")
                 _, response = self.pending_requests.pop(request_id, (None, None))
                 if response:
                     logging.info(f"收到客户端响应 (请求ID: {request_id}, 类型: {response.get('type')})")
@@ -637,7 +656,7 @@ class TunnelServer:
                     return None
             else:
                 # 超时
-                logging.warning(f"等待客户端响应超时 (请求ID: {request_id})")
+                logging.warning(f"等待客户端爬虫响应超时 (请求ID: {request_id}, 5分钟)")
                 self.pending_requests.pop(request_id, None)
                 return None
                 
@@ -758,14 +777,21 @@ class TunnelServer:
             while self.running:
                 try:
                     current_time = time.time()
-                    dead_tunnels = []
                     
                     for tunnel_id, client_socket in list(self.tunnels.items()):
                         last_seen = self.client_last_seen.get(tunnel_id, current_time)
                         idle_time = current_time - last_seen
                         
-                        # 如果超过3分钟没有活动，主动检测连接状态
-                        if idle_time > 180:  # 3分钟
+                        # 检查是否有正在处理的请求
+                        has_pending_requests = any(
+                            req_id for req_id in self.pending_requests.keys()
+                            if req_id.startswith(tunnel_id) or True  # 简化检查
+                        )
+                        
+                        # 如果有正在处理的请求，延长检测时间
+                        timeout_threshold = 600 if has_pending_requests else 300  # 10分钟 vs 5分钟
+                        
+                        if idle_time > timeout_threshold:
                             try:
                                 # 尝试发送一个ping消息来检测连接
                                 ping_timestamp = current_time
@@ -781,20 +807,13 @@ class TunnelServer:
                                 new_last_seen = self.client_last_seen.get(tunnel_id, last_seen)
                                 if new_last_seen <= last_seen:
                                     # 没有收到响应，可能是僵尸连接
-                                    dead_tunnels.append(tunnel_id)
                                     logging.warning(f"检测到僵尸隧道: {tunnel_id} (ping无响应，发送时间: {ping_timestamp}，最后活跃: {last_seen})")
                                 else:
                                     logging.info(f"隧道 {tunnel_id} ping检测正常，响应时间: {new_last_seen - ping_timestamp:.2f}秒")
                                     
                             except Exception as e:
                                 # 发送失败，标记为死连接
-                                dead_tunnels.append(tunnel_id)
                                 logging.warning(f"检测到僵尸隧道: {tunnel_id} (ping发送失败: {e})")
-                    
-                    # 清理死连接
-                    for tunnel_id in dead_tunnels:
-                        self.cleanup_tunnel(tunnel_id)
-                        logging.info(f"已清理僵尸隧道: {tunnel_id}")
                     
                     # 统计当前连接数
                     connection_count = len(self.tunnels)
