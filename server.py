@@ -355,6 +355,33 @@ class TunnelServer:
                 else:
                     logging.warning(f"收到未知连接的ping消息: {client_address}")
                 
+            elif message_type == "pong":
+                # 处理客户端的pong响应
+                tunnel_id = None
+                for tid, socket in self.tunnels.items():
+                    if socket == client_socket:
+                        tunnel_id = tid
+                        break
+                
+                if tunnel_id:
+                    original_timestamp = message.get('original_timestamp')
+                    current_time = time.time()
+                    
+                    if original_timestamp:
+                        rtt = current_time - original_timestamp
+                        logging.info(f"收到隧道 {tunnel_id} 的pong响应，往返时间: {rtt:.3f}秒，原始时间戳: {original_timestamp}")
+                    else:
+                        logging.info(f"收到隧道 {tunnel_id} 的pong响应，时间戳: {message.get('timestamp', 'N/A')}")
+                    
+                    # 更新最后活跃时间
+                    self.client_last_seen[tunnel_id] = current_time
+                    
+                    # 如果有等待ping响应的记录，可以在这里处理
+                    # 例如更新连接状态等
+                    
+                else:
+                    logging.warning(f"收到未知连接的pong响应: {client_address}")
+            
             elif message_type == "response" or message_type == "error":
                 request_id = message["request_id"]
                 if request_id in self.pending_requests:
