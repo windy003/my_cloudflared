@@ -583,6 +583,14 @@ class TunnelClient:
             logging.error(f"连接健康检查失败: {e}")
             return False
 
+    def reconnect(self):
+        try:
+            self.control_socket.close()
+        except:
+            pass
+        self.connect_to_server()
+        logging.info("已重新连接到服务器")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="内网穿透客户端")
     parser.add_argument("--server", required=True, help="服务器地址")

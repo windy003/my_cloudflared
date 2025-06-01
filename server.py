@@ -42,6 +42,7 @@ class TunnelServer:
         self.client_last_seen = {}  # 记录客户端最后活跃时间
         self.heartbeat_timeout = 90  # 心跳超时时间（秒）
         self.current_connections = 0  # 改为实例变量
+        self.timeout = 120  # 新增timeout属性
         
     def check_port_available(self, port):
         """检查端口是否可用"""
@@ -846,6 +847,13 @@ class TunnelServer:
             if tid == tunnel_id:
                 del self.domain_tunnels[subdomain]
                 logging.info(f"已清理子域名映射: {subdomain} -> {tunnel_id}")
+
+    def cleanup_zombie_tunnels(self):
+        now = time.time()
+        for tunnel_id, tunnel_info in list(self.tunnels.items()):
+            if now - tunnel_info['last_activity'] > self.timeout:
+                logging.warning(f"检测到僵尸隧道: {tunnel_id}，已清理")
+                del self.tunnels[tunnel_id]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="内网穿透服务器")
