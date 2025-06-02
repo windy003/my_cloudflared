@@ -1,3 +1,7 @@
 +50    def forward_request_to_client(self, tunnel_id, request_data):
 
++20    def start_heartbeat(self, client_socket, tunnel_id):
 
++20    def format_time_duration(self, seconds):
+
+70     def start_connection_monitor(self):

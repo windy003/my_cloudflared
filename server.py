@@ -734,7 +734,7 @@ class TunnelServer:
                         # 检查是否有正在处理的请求
                         has_pending_requests = any(
                             req_id for req_id in self.pending_requests.keys()
-                            if req_id.startswith(tunnel_id) or True  # 简化检查
+                            if req_id.startswith(tunnel_id)  # 简化检查
                         )
                         
                         # 如果有正在处理的请求，延长检测时间
