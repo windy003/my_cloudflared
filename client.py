@@ -90,7 +90,7 @@ class TunnelClient:
                     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
                     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6)
                     
-                    logging.info(f"成功连接到服务器")
+                    logging.info("成功连接到服务器")
                     
                     # 连接成功后重置超时设置
                     sock.settimeout(None)
@@ -136,7 +136,7 @@ class TunnelClient:
                     self.reconnect_attempts = 0
                     
                 except socket.error as e:
-                    logging.error(f"连接错误: {e}")
+                    logging.error(f"连接失败: {e}")
                     if self.control_socket:
                         self.control_socket.close()
                         self.control_socket = None
