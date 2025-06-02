@@ -1,7 +1,1 @@
-+30    main
-
-+20    def __init__(self, server_host, server_port, local_host, local_port, tunnel_id=None, subdomain=None, use_ssl=True):
-
-100    def connect_to_server(self):
-
-
+100+    def handle_request(self, request_id, data):

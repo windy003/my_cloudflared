@@ -415,67 +415,6 @@ class TunnelClient:
                 except:
                     pass
     
-    def send_test_response(self, request_id):
-        """发送测试响应"""
-        try:
-            logging.info(f"发送测试响应: {request_id}")
-            response_data = {
-                "status": 200,
-                "headers": {"Content-Type": "text/html"},
-                "body": f"""
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <title>隧道测试</title>
-                    <style>
-                        body {{
-                            font-family: Arial, sans-serif;
-                            margin: 40px;
-                            line-height: 1.6;
-                        }}
-                        .container {{
-                            max-width: 800px;
-                            margin: 0 auto;
-                            padding: 20px;
-                            border: 1px solid #ddd;
-                            border-radius: 5px;
-                        }}
-                        h1 {{
-                            color: #2c3e50;
-                        }}
-                        .success {{
-                            color: #27ae60;
-                            font-weight: bold;
-                        }}
-                    </style>
-                </head>
-                <body>
-                    <div class="container">
-                        <h1>内网穿透测试</h1>
-                        <p class="success">✅ 隧道工作正常!</p>
-                        <p>请求ID: {request_id}</p>
-                        <p>隧道ID: {self.tunnel_id}</p>
-                        <p>时间: {time.strftime('%Y-%m-%d %H:%M:%S')}</p>
-                        <hr>
-                        <p>服务器: {self.server_host}:{self.server_port}</p>
-                        <p>本地服务: {self.local_host}:{self.local_port}</p>
-                    </div>
-                </body>
-                </html>
-                """
-            }
-            
-            response_msg = {
-                "type": "response",
-                "request_id": request_id,
-                "data": json.dumps(response_data)
-            }
-            
-            self.send_message(response_msg)
-            logging.info(f"测试响应已发送: {request_id}")
-        except Exception as e:
-            logging.error(f"发送测试响应错误: {e}")
-            self.send_error_response(request_id, f"发送测试响应错误: {str(e)}")
     
     def send_success_response(self, request_id, response_data):
         """发送成功响应"""
