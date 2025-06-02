@@ -816,12 +816,6 @@ class TunnelServer:
                 del self.domain_tunnels[subdomain]
                 logging.info(f"已清理子域名映射: {subdomain} -> {tunnel_id}")
 
-    def cleanup_zombie_tunnels(self):
-        now = time.time()
-        for tunnel_id, tunnel_info in list(self.tunnels.items()):
-            if now - tunnel_info['last_activity'] > self.timeout:
-                logging.warning(f"检测到僵尸隧道: {tunnel_id}，已清理")
-                del self.tunnels[tunnel_id]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="内网穿透服务器")
