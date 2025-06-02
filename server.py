@@ -674,60 +674,6 @@ class TunnelServer:
         self.running = False
         logging.info("正在停止服务器...")
 
-    def send_test_response(self, request_id):
-        """发送测试响应"""
-        try:
-            logging.info(f"发送测试响应: {request_id}")
-            response_data = {
-                "status": 200,
-                "headers": {"Content-Type": "text/html; charset=utf-8"},  # 明确指定UTF-8编码
-                "body": f"""
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <meta charset="utf-8">  <!-- 添加此行确保HTML正确解析UTF-8 -->
-                    <title>隧道测试</title>
-                    <style>
-                        body {{
-                            font-family: Arial, sans-serif;
-                            margin: 40px;
-                            line-height: 1.6;
-                        }}
-                        .container {{
-                            max-width: 800px;
-                            margin: 0 auto;
-                            padding: 20px;
-                            border: 1px solid #ddd;
-                            border-radius: 5px;
-                        }}
-                        h1 {{
-                            color: #2c3e50;
-                        }}
-                        .success {{
-                            color: #27ae60;
-                            font-weight: bold;
-                        }}
-                    </style>
-                </head>
-                <body>
-                    <div class="container">
-                        <h1>内网穿透测试</h1>
-                        <p class="success">✅ 隧道工作正常!</p>
-                        <p>请求ID: {request_id}</p>
-                        <p>隧道ID: {self.tunnel_id}</p>
-                        <p>时间: {time.strftime('%Y-%m-%d %H:%M:%S')}</p>
-                        <hr>
-                        <p>服务器: {self.server_host}:{self.server_port}</p>
-                        <p>本地服务: {self.local_host}:{self.local_port}</p>
-                    </div>
-                </body>
-                </html>
-                """
-            }
-            
-
-        except Exception as e:
-            logging.error(f"发送测试响应错误: {e}")
 
     # 添加一个新方法用于注册子域名
     def register_subdomain(self, subdomain, tunnel_id):
