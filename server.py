@@ -425,12 +425,12 @@ class TunnelServer:
                 logging.error(f"HTTP端口 {self.http_port} 已被占用，尝试释放...")
                 # 尝试终止占用端口的进程
                 os.system(f"fuser -k {self.http_port}/tcp")
-                time.sleep(10)  # 等待端口释放
+                time.sleep(3)  # 等待端口释放
             logging.error(f"HTTP服务器发生错误: {e}", exc_info=True)
             if self.running:
                 # 尝试重启HTTP服务器
                 logging.info("尝试重启HTTP服务器...")
-                time.sleep(5)
+                time.sleep(3)
                 self.run_http_server()
     
     def create_http_server(self):
