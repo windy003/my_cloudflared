@@ -393,21 +393,24 @@ class TunnelServer:
                     logging.warning(f"收到未知请求ID的响应: {request_id}")
             
             elif message_type == "progress":
-                # 处理爬虫进度更新
+                # 新增：处理进度更新
                 request_id = message.get("request_id")
-                progress_message = message.get("message")
+                progress_message = message.get("message", "")
                 timestamp = message.get("timestamp", time.time())
                 
-                logging.info(f"爬虫进度 (请求ID: {request_id}): {progress_message}")
+                logging.info(f"爬虫进度更新 (请求ID: {request_id}): {progress_message}")
                 
-                # 可以选择将进度信息存储或转发给前端
-                # 这里只是记录日志
+                # 更新请求的最后活动时间，防止超时
+                if request_id in self.pending_requests:
+                    event, _ = self.pending_requests[request_id]
+                    # 这里可以记录进度，但不触发事件完成
+                    logging.debug(f"请求 {request_id} 仍在处理中，已更新活动时间")
             
             else:
-                logging.warning(f"收到未知类型的消息: {message['type']}")
+                logging.warning(f"收到未知类型的消息: {message_type}")
         
-        except json.JSONDecodeError:
-            logging.error(f"JSON解析错误: {message_str[:100]}...")
+        except json.JSONDecodeError as e:
+            logging.error(f"解析客户端消息失败: {e}")
         except Exception as e:
             logging.error(f"处理客户端消息错误: {e}")
     

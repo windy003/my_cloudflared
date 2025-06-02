@@ -350,27 +350,34 @@ class TunnelClient:
             while True:
                 try:
                     current_time = time.time()
+                    elapsed = int(current_time - start_time)
                     
-                    # 每30秒发送一次进度更新
+                    # 每30秒发送一次进度更新，包含更详细信息
                     if current_time - last_progress_time > 30:
-                        elapsed = int(current_time - start_time)
-                        self.send_progress_update(request_id, f"爬虫运行中... 已耗时{elapsed}秒")
+                        data_received = len(response)
+                        self.send_progress_update(request_id, 
+                            f"爬虫运行中... 已耗时{elapsed}秒，已接收数据{data_received}字节")
                         last_progress_time = current_time
                     
                     local_socket.settimeout(30)
                     chunk = local_socket.recv(4096)
                     
                     if not chunk:
+                        logging.info(f"本地服务连接关闭，总共接收{len(response)}字节")
                         break
                     response += chunk
                     
                 except socket.timeout:
+                    elapsed = int(time.time() - start_time)
                     # 检查总时间
-                    if time.time() - start_time > 300:  # 5分钟
-                        logging.warning("爬虫任务超时")
-                        self.send_progress_update(request_id, "爬虫任务超时")
+                    if elapsed > 300:  # 5分钟
+                        logging.warning(f"爬虫任务超时，已运行{elapsed}秒")
+                        self.send_progress_update(request_id, f"爬虫任务超时，已运行{elapsed}秒")
                         break
-                    continue
+                    else:
+                        # 继续等待，但记录状态
+                        logging.debug(f"等待爬虫数据中... 已运行{elapsed}秒")
+                        continue
             
             # 爬虫完成
             elapsed = int(time.time() - start_time)
@@ -617,7 +624,7 @@ class TunnelClient:
         logging.info("已重新连接到服务器")
 
     def send_progress_update(self, request_id, message):
-        """发送爬虫进度更新"""
+        """发送进度更新到服务器"""
         try:
             progress_msg = {
                 "type": "progress",
@@ -626,10 +633,13 @@ class TunnelClient:
                 "timestamp": time.time()
             }
             
-            self.send_message(progress_msg)
-            logging.info(f"进度更新: {message}")
+            success = self.send_message(progress_msg)
+            if success:
+                logging.info(f"进度更新已发送: {message}")
+            else:
+                logging.warning(f"进度更新发送失败: {message}")
         except Exception as e:
-            logging.error(f"发送进度更新失败: {e}")
+            logging.error(f"发送进度更新错误: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="内网穿透客户端")
