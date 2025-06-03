@@ -16,6 +16,7 @@ import logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import time
 import os
+import requests  # 新增导入
 
 # 配置日志
 logging.basicConfig(
@@ -69,6 +70,9 @@ class TunnelServer:
         # 添加这一行 - 启动连接监控
         self.start_connection_monitor()
         
+        # 启动HTTP服务器状态监控
+        self.start_http_server_monitor()
+        
         # 启动控制服务器（接受客户端连接）
         control_thread = threading.Thread(target=self.run_control_server)
         control_thread.daemon = True
@@ -85,6 +89,91 @@ class TunnelServer:
                 time.sleep(1)
         except KeyboardInterrupt:
             self.stop()
+    
+    def check_http_server_status(self):
+        """检查HTTP服务器状态"""
+        try:
+            # 构建检查URL
+            protocol = "https" if self.use_ssl else "http"
+            check_url = f"{protocol}://{self.bind_host}:{self.http_port}/health_check"
+            
+            # 如果bind_host是0.0.0.0，使用localhost进行检查
+            if self.bind_host == "0.0.0.0":
+                check_url = f"{protocol}://localhost:{self.http_port}/health_check"
+            
+            # 发送健康检查请求
+            response = requests.get(check_url, timeout=10, verify=False)
+            
+            # 只要能收到响应（无论状态码是什么），都表明HTTP服务器正在运行
+            return {
+                "status": "运行中",
+                "response_code": response.status_code,
+                "response_time": response.elapsed.total_seconds(),
+                "error": None
+            }
+                
+        except requests.exceptions.ConnectionError:
+            return {
+                "status": "连接失败",
+                "response_code": None,
+                "response_time": None,
+                "error": "无法连接到HTTP服务器"
+            }
+        except requests.exceptions.Timeout:
+            return {
+                "status": "超时",
+                "response_code": None,
+                "response_time": None,
+                "error": "HTTP服务器响应超时"
+            }
+        except Exception as e:
+            return {
+                "status": "错误",
+                "response_code": None,
+                "response_time": None,
+                "error": str(e)
+            }
+    
+    def start_http_server_monitor(self):
+        """启动HTTP服务器状态监控"""
+        def monitor_http_server():
+            logging.info("HTTP服务器状态监控已启动，每分钟检查一次")
+            
+            while self.running:
+                try:
+                    # 检查HTTP服务器状态
+                    status_info = self.check_http_server_status()
+                    
+                    # 构建状态消息
+                    status_msg = f"HTTP服务器状态检查 - 状态: {status_info['status']}"
+                    
+                    if status_info['response_code'] is not None:
+                        status_msg += f", 响应码: {status_info['response_code']}"
+                    
+                    if status_info['response_time'] is not None:
+                        status_msg += f", 响应时间: {status_info['response_time']:.3f}秒"
+                    
+                    if status_info['error']:
+                        status_msg += f", 错误: {status_info['error']}"
+                    
+                    # 直接记录到主日志文件 tunnel_server.log
+                    if status_info['status'] == "运行中":
+                        logging.info(status_msg)  # 正常状态使用info级别
+                    else:
+                        logging.warning(status_msg)  # 异常状态使用warning级别
+                    
+                    # 等待60秒（1分钟）
+                    time.sleep(60)
+                    
+                except Exception as e:
+                    error_msg = f"HTTP服务器状态监控出错: {e}"
+                    logging.error(error_msg)
+                    time.sleep(60)
+        
+        # 启动监控线程
+        monitor_thread = threading.Thread(target=monitor_http_server)
+        monitor_thread.daemon = True
+        monitor_thread.start()
     
     def run_control_server(self):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
