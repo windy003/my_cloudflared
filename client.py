@@ -536,13 +536,6 @@ class TunnelClient:
         heartbeat_thread.daemon = True
         heartbeat_thread.start()
 
-    def reconnect(self):
-        try:
-            self.control_socket.close()
-        except:
-            pass
-        self.connect_to_server()
-        logging.info("已重新连接到服务器")
 
     def send_progress_update(self, request_id, message):
         """发送进度更新到服务器"""
