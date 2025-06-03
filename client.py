@@ -536,24 +536,6 @@ class TunnelClient:
         heartbeat_thread.daemon = True
         heartbeat_thread.start()
 
-    def check_connection_health(self):
-        """检查连接健康状态"""
-        if not self.control_socket:
-            logging.warning("连接健康检查失败: 控制socket不存在")
-            return False
-        
-        try:
-            # 发送一个简单的ping消息
-            ping_timestamp = time.time()
-            ping_msg = {"type": "ping", "timestamp": ping_timestamp}
-            ping_json = json.dumps(ping_msg) + '\n'
-            self.control_socket.sendall(ping_json.encode('utf-8'))
-            logging.info(f"发送连接健康检查ping，时间戳: {ping_timestamp}")
-            return True
-        except Exception as e:
-            logging.error(f"连接健康检查失败: {e}")
-            return False
-
     def reconnect(self):
         try:
             self.control_socket.close()

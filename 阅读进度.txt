@@ -1,1 +1,10 @@
-100+    def handle_request(self, request_id, data):
++10    def send_success_response(self, request_id, response_data):
+
+
++20    def send_error_response(self, request_id, error_message):
+
++40    def parse_http_response(self, response_bytes):
+
+
++30    def start_heartbeat(self):
+    
