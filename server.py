@@ -93,13 +93,13 @@ class TunnelServer:
     def check_http_server_status(self):
         """检查HTTP服务器状态"""
         try:
-            # 构建检查URL
+            # 构建检查URL - 使用一个简单的根路径请求
             protocol = "https" if self.use_ssl else "http"
-            check_url = f"{protocol}://{self.bind_host}:{self.http_port}/health_check"
+            check_url = f"{protocol}://{self.bind_host}:{self.http_port}/"
             
             # 如果bind_host是0.0.0.0，使用localhost进行检查
             if self.bind_host == "0.0.0.0":
-                check_url = f"{protocol}://localhost:{self.http_port}/health_check"
+                check_url = f"{protocol}://localhost:{self.http_port}/"
             
             # 发送健康检查请求
             response = requests.get(check_url, timeout=10, verify=False)
@@ -533,6 +533,15 @@ class TunnelServer:
                 self.handle_request()
                 
             def handle_request(self):
+                # 特殊处理：如果是根路径请求且没有隧道，返回服务器状态信息
+                if self.path == "/" and not tunnel_server.tunnels:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.end_headers()
+                    status_info = f"隧道服务器运行中\n当前活跃隧道数: {len(tunnel_server.tunnels)}\n"
+                    self.wfile.write(status_info.encode('utf-8'))
+                    return
+                
                 # 首先检查Host头部,处理子域名
                 host = self.headers.get('Host', '')
                 logging.info(f"收到请求: Host={host}, Path={self.path}")
