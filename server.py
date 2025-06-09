@@ -504,23 +504,38 @@ class TunnelServer:
             logging.error(f"处理客户端消息错误: {e}")
     
     def run_http_server(self):
-        try:
-            # 创建HTTP服务器来接收外部请求
-            server = self.create_http_server()
-            logging.info(f"HTTP服务器运行在 {self.bind_host}:{self.http_port}")
-            server.serve_forever()
-        except OSError as e:
-            if e.errno == 98:  # 地址已被使用
-                logging.error(f"HTTP端口 {self.http_port} 已被占用，尝试释放...")
-                # 尝试终止占用端口的进程
-                os.system(f"fuser -k {self.http_port}/tcp")
-                time.sleep(3)  # 等待端口释放
-            logging.error(f"HTTP服务器发生错误: {e}", exc_info=True)
-            if self.running:
-                # 尝试重启HTTP服务器
-                logging.info("尝试重启HTTP服务器...")
+        retry_count = 0
+        max_retries = 5
+        
+        while self.running and retry_count < max_retries:
+            try:
+                # 创建HTTP服务器来接收外部请求
+                server = self.create_http_server()
+                logging.info(f"HTTP服务器运行在 {self.bind_host}:{self.http_port}")
+                server.serve_forever()
+                # 如果正常退出循环，说明服务器正常关闭
+                break
+                
+            except OSError as e:
+                retry_count += 1
+                if e.errno == 98:  # 地址已被使用
+                    logging.error(f"HTTP端口 {self.http_port} 已被占用，尝试释放... (重试 {retry_count}/{max_retries})")
+                    os.system(f"fuser -k {self.http_port}/tcp")
+                    time.sleep(5)  # 增加等待时间
+                else:
+                    logging.error(f"HTTP服务器发生错误: {e} (重试 {retry_count}/{max_retries})", exc_info=True)
+                    time.sleep(3)
+                
+            except Exception as e:
+                retry_count += 1
+                logging.error(f"HTTP服务器发生未预期错误: {e} (重试 {retry_count}/{max_retries})", exc_info=True)
                 time.sleep(3)
-                self.run_http_server()
+        
+        if retry_count >= max_retries:
+            logging.error("HTTP服务器重启次数过多，停止尝试")
+            # 可以选择设置一个标志或通知主程序
+        
+        logging.info("HTTP服务器线程退出")
     
     def create_http_server(self):
         tunnel_server = self
