@@ -138,6 +138,7 @@ class TunnelServer:
         """启动HTTP服务器状态监控"""
         def monitor_http_server():
             logging.info("HTTP服务器状态监控已启动，每分钟检查一次")
+            consecutive_failures = 0
             
             while self.running:
                 try:
@@ -156,11 +157,19 @@ class TunnelServer:
                     if status_info['error']:
                         status_msg += f", 错误: {status_info['error']}"
                     
-                    # 直接记录到主日志文件 tunnel_server.log
+                    # 记录日志和处理失败
                     if status_info['status'] == "运行中":
-                        logging.info(status_msg)  # 正常状态使用info级别
+                        logging.info(status_msg)
+                        consecutive_failures = 0  # 重置失败计数
                     else:
-                        logging.warning(status_msg)  # 异常状态使用warning级别
+                        logging.warning(status_msg)
+                        consecutive_failures += 1
+                        
+                        # 如果连续失败3次，尝试重启HTTP服务器
+                        if consecutive_failures >= 3:
+                            logging.error("HTTP服务器连续失败3次，尝试重启...")
+                            self.restart_http_server()
+                            consecutive_failures = 0  # 重置计数
                     
                     # 等待60秒（1分钟）
                     time.sleep(60)
@@ -174,6 +183,33 @@ class TunnelServer:
         monitor_thread = threading.Thread(target=monitor_http_server)
         monitor_thread.daemon = True
         monitor_thread.start()
+    
+    def restart_http_server(self):
+        """重启HTTP服务器"""
+        try:
+            logging.info("正在重启HTTP服务器...")
+            
+            # 如果有现有的HTTP服务器实例，尝试关闭它
+            if hasattr(self, 'http_server_instance') and self.http_server_instance:
+                try:
+                    self.http_server_instance.shutdown()
+                    self.http_server_instance.server_close()
+                    logging.info("已关闭旧的HTTP服务器实例")
+                except Exception as e:
+                    logging.warning(f"关闭旧HTTP服务器时出错: {e}")
+            
+            # 等待一段时间确保端口释放
+            time.sleep(2)
+            
+            # 启动新的HTTP服务器线程
+            http_thread = threading.Thread(target=self.run_http_server)
+            http_thread.daemon = True
+            http_thread.start()
+            
+            logging.info("HTTP服务器重启完成")
+            
+        except Exception as e:
+            logging.error(f"重启HTTP服务器失败: {e}")
     
     def run_control_server(self):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -504,36 +540,53 @@ class TunnelServer:
             logging.error(f"处理客户端消息错误: {e}")
     
     def run_http_server(self):
-        retry_count = 0
-        max_retries = 5
+        """运行HTTP服务器，支持自动重启"""
+        consecutive_failures = 0
+        max_consecutive_failures = 3
         
-        while self.running and retry_count < max_retries:
+        while self.running:
             try:
-                # 创建HTTP服务器来接收外部请求
+                # 创建HTTP服务器
                 server = self.create_http_server()
                 logging.info(f"HTTP服务器运行在 {self.bind_host}:{self.http_port}")
+                
+                # 保存服务器实例
+                self.http_server_instance = server
+                
+                # 重置失败计数
+                consecutive_failures = 0
+                
+                # 启动服务器
                 server.serve_forever()
-                # 如果正常退出循环，说明服务器正常关闭
-                break
+                
+                # 如果到达这里，说明serve_forever()退出了
+                logging.warning("HTTP服务器意外退出，准备重启...")
                 
             except OSError as e:
-                retry_count += 1
-                if e.errno == 98:  # 地址已被使用
-                    logging.error(f"HTTP端口 {self.http_port} 已被占用，尝试释放... (重试 {retry_count}/{max_retries})")
+                consecutive_failures += 1
+                if e.errno == 98:  # 端口被占用
+                    logging.error(f"HTTP端口被占用，尝试释放...")
                     os.system(f"fuser -k {self.http_port}/tcp")
-                    time.sleep(5)  # 增加等待时间
+                    time.sleep(5)
                 else:
-                    logging.error(f"HTTP服务器发生错误: {e} (重试 {retry_count}/{max_retries})", exc_info=True)
+                    logging.error(f"HTTP服务器OSError: {e}", exc_info=True)
                     time.sleep(3)
                 
             except Exception as e:
-                retry_count += 1
-                logging.error(f"HTTP服务器发生未预期错误: {e} (重试 {retry_count}/{max_retries})", exc_info=True)
+                consecutive_failures += 1
+                logging.error(f"HTTP服务器异常: {e}", exc_info=True)
                 time.sleep(3)
-        
-        if retry_count >= max_retries:
-            logging.error("HTTP服务器重启次数过多，停止尝试")
-            # 可以选择设置一个标志或通知主程序
+            
+            # 检查连续失败次数
+            if consecutive_failures >= max_consecutive_failures:
+                logging.error(f"HTTP服务器连续失败{consecutive_failures}次，暂停重启")
+                time.sleep(30)  # 等待30秒后重置计数
+                consecutive_failures = 0
+            
+            # 如果不是正常关闭，等待一段时间后重启
+            if self.running:
+                logging.info("等待3秒后重启HTTP服务器...")
+                time.sleep(3)
         
         logging.info("HTTP服务器线程退出")
     
