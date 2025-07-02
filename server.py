@@ -235,6 +235,7 @@ class TunnelServer:
                 self.handle_client_connection(client_socket, client_address)
             finally:
                 self.current_connections -= 1
+                logging.info(f"连接 {client_address} 已断开，当前连接数: {self.current_connections}")
         
         while self.running:
             try:
@@ -514,6 +515,10 @@ class TunnelServer:
                     event, _ = self.pending_requests[request_id]
                     self.pending_requests[request_id] = (event, message)
                     event.set()
+                    if message_type == "error":
+                        logging.warning(f"收到客户端错误响应 (请求ID: {request_id}): {message.get('error', '未知错误')}")
+                    else:
+                        logging.info(f"收到客户端成功响应 (请求ID: {request_id})")
                 else:
                     logging.warning(f"收到未知请求ID的响应: {request_id}")
             
