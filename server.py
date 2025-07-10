@@ -1,7 +1,7 @@
 # 运行的命令:
-# 有ssl
-#  python3 server.py --control-port 8000 --http-port 80 --no-ssl
 # 无ssl
+#  python3 server.py --control-port 8000 --http-port 80 --no-ssl
+# 有ssl
 # sudo python3 server.py --control-port 8000 --http-port 443 --cert /etc/letsencrypt/live/windy.run/fullchain.pem --key  /etc/letsencrypt/live/windy.run/privkey.pem
 
 
@@ -17,6 +17,9 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import time
 import os
 import requests  # 新增导入
+import select
+import signal
+import sys
 
 # 配置日志
 logging.basicConfig(
@@ -41,54 +44,79 @@ class TunnelServer:
         self.pending_requests = {}  # request_id -> response_event, response_data
         self.running = False
         self.client_last_seen = {}  # 记录客户端最后活跃时间
-        self.heartbeat_timeout = 90  # 心跳超时时间（秒）
+        self.heartbeat_timeout = 120  # 心跳超时时间（秒）增加到2分钟
         self.current_connections = 0  # 改为实例变量
-        self.timeout = 120  # 新增timeout属性
+        self.timeout = 180  # 增加超时时间到3分钟
+        self.shutdown_event = threading.Event()  # 优雅关闭事件
+        self.http_server_instance = None
+        self.control_server_socket = None
+        
+        # 注册信号处理器
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        
+    def _signal_handler(self, signum, frame):
+        """处理信号，优雅关闭"""
+        logging.info(f"收到信号 {signum}，开始优雅关闭服务器...")
+        self.stop()
         
     def check_port_available(self, port):
         """检查端口是否可用"""
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind((self.bind_host, port))
             s.close()
             return True
-        except:
+        except socket.error:
             return False
+        finally:
+            try:
+                s.close()
+            except:
+                pass
 
     def start(self):
         self.running = True
+        self.shutdown_event.clear()
         
         # 检查端口可用性
         if not self.check_port_available(self.http_port):
-            logging.error(f"HTTP端口 {self.http_port} 已被占用，无法启动服务器")
-            os.system(f"fuser -k {self.http_port}/tcp")
-            time.sleep(5)
+            logging.error(f"HTTP端口 {self.http_port} 已被占用，尝试释放...")
+            try:
+                os.system(f"fuser -k {self.http_port}/tcp 2>/dev/null")
+                time.sleep(5)
+            except:
+                pass
+            
             if not self.check_port_available(self.http_port):
                 logging.error("无法释放端口，服务器启动失败")
                 return False
         
-        # 添加这一行 - 启动连接监控
-        self.start_connection_monitor()
-        
-        # 启动HTTP服务器状态监控
-        self.start_http_server_monitor()
+        # 启动各种监控服务
+        self._start_connection_monitor()
+        self._start_http_server_monitor() 
         
         # 启动控制服务器（接受客户端连接）
-        control_thread = threading.Thread(target=self.run_control_server)
+        control_thread = threading.Thread(target=self.run_control_server, name="ControlServer")
         control_thread.daemon = True
         control_thread.start()
         
         # 启动HTTP服务器（接受外部请求）
-        http_thread = threading.Thread(target=self.run_http_server)
+        http_thread = threading.Thread(target=self.run_http_server, name="HttpServer")
         http_thread.daemon = True
         http_thread.start()
         
+        logging.info("服务器启动完成")
+        
         # 主线程保持运行
         try:
-            while self.running:
-                time.sleep(1)
+            while self.running and not self.shutdown_event.is_set():
+                self.shutdown_event.wait(1)
         except KeyboardInterrupt:
             self.stop()
+        
+        logging.info("服务器主循环结束")
     
     def check_http_server_status(self):
         """检查HTTP服务器状态"""
@@ -134,13 +162,13 @@ class TunnelServer:
                 "error": str(e)
             }
     
-    def start_http_server_monitor(self):
+    def _start_http_server_monitor(self):
         """启动HTTP服务器状态监控"""
         def monitor_http_server():
-            logging.info("HTTP服务器状态监控已启动，每分钟检查一次")
+            logging.info("HTTP服务器状态监控已启动，每2分钟检查一次")
             consecutive_failures = 0
             
-            while self.running:
+            while self.running and not self.shutdown_event.is_set():
                 try:
                     # 检查HTTP服务器状态
                     status_info = self.check_http_server_status()
@@ -159,28 +187,30 @@ class TunnelServer:
                     
                     # 记录日志和处理失败
                     if status_info['status'] == "运行中":
-                        logging.info(status_msg)
+                        logging.debug(status_msg)
                         consecutive_failures = 0  # 重置失败计数
                     else:
                         logging.warning(status_msg)
                         consecutive_failures += 1
                         
-                        # 如果连续失败3次，尝试重启HTTP服务器
-                        if consecutive_failures >= 3:
-                            logging.error("HTTP服务器连续失败3次，尝试重启...")
+                        # 如果连续失败5次，尝试重启HTTP服务器
+                        if consecutive_failures >= 5:
+                            logging.error("HTTP服务器连续失败5次，尝试重启...")
                             self.restart_http_server()
                             consecutive_failures = 0  # 重置计数
                     
-                    # 等待60秒（1分钟）
-                    time.sleep(60)
+                    # 等待120秒（2分钟）或关闭事件
+                    if self.shutdown_event.wait(120):
+                        break
                     
                 except Exception as e:
                     error_msg = f"HTTP服务器状态监控出错: {e}"
                     logging.error(error_msg)
-                    time.sleep(60)
+                    if self.shutdown_event.wait(60):
+                        break
         
         # 启动监控线程
-        monitor_thread = threading.Thread(target=monitor_http_server)
+        monitor_thread = threading.Thread(target=monitor_http_server, name="HttpMonitor")
         monitor_thread.daemon = True
         monitor_thread.start()
     
@@ -197,12 +227,45 @@ class TunnelServer:
                     logging.info("已关闭旧的HTTP服务器实例")
                 except Exception as e:
                     logging.warning(f"关闭旧HTTP服务器时出错: {e}")
+                finally:
+                    self.http_server_instance = None
             
-            # 等待一段时间确保端口释放
-            time.sleep(2)
+            # 强制释放端口（Windows版本）
+            try:
+                import subprocess
+                # 在Windows上查找并杀死占用端口的进程
+                result = subprocess.run(['netstat', '-ano'], capture_output=True, text=True)
+                for line in result.stdout.split('\n'):
+                    if f':{self.http_port}' in line and 'LISTENING' in line:
+                        parts = line.split()
+                        if len(parts) >= 5:
+                            pid = parts[-1]
+                            try:
+                                subprocess.run(['taskkill', '/F', '/PID', pid], check=True)
+                                logging.info(f"已终止占用端口{self.http_port}的进程 PID: {pid}")
+                            except subprocess.CalledProcessError:
+                                logging.warning(f"无法终止进程 PID: {pid}")
+            except Exception as e:
+                logging.warning(f"端口释放操作失败: {e}")
+            
+            # 等待更长时间确保端口完全释放
+            time.sleep(5)
+            
+            # 检查端口是否可用
+            max_retries = 10
+            for i in range(max_retries):
+                if self.check_port_available(self.http_port):
+                    logging.info(f"端口 {self.http_port} 已可用")
+                    break
+                else:
+                    logging.warning(f"端口 {self.http_port} 仍被占用，等待中... ({i+1}/{max_retries})")
+                    time.sleep(2)
+            else:
+                logging.error(f"端口 {self.http_port} 在 {max_retries} 次尝试后仍无法使用")
+                return
             
             # 启动新的HTTP服务器线程
-            http_thread = threading.Thread(target=self.run_http_server)
+            http_thread = threading.Thread(target=self.run_http_server, name="HttpServer-Restart")
             http_thread.daemon = True
             http_thread.start()
             
@@ -212,68 +275,99 @@ class TunnelServer:
             logging.error(f"重启HTTP服务器失败: {e}")
     
     def run_control_server(self):
+        """运行控制服务器，接受客户端连接"""
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
-        server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
-        server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6)
-        server_socket.bind((self.bind_host, self.bind_port))
-        server_socket.listen(5)
+        if hasattr(socket, 'TCP_KEEPIDLE'):
+            server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+            server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+            server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6)
         
-        logging.info(f"控制服务器运行在 {self.bind_host}:{self.bind_port}")
+        server_socket.settimeout(1.0)  # 设置超时以便可以检查关闭事件
+        self.control_server_socket = server_socket
         
-        if self.use_ssl:
-            context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-            context.load_cert_chain(certfile=self.cert_file, keyfile=self.key_file)
-        
-        # 添加连接计数和限制
-        max_connections = 100  # 最大同时处理的连接数
-        
-        def _handle_client_connection_wrapper(client_socket, client_address):
-            try:
-                self.handle_client_connection(client_socket, client_address)
-            finally:
-                self.current_connections -= 1
-                logging.info(f"连接 {client_address} 已断开，当前连接数: {self.current_connections}")
-        
-        while self.running:
-            try:
-                # 如果当前连接数达到上限，等待一段时间再接受新连接
-                if self.current_connections >= max_connections:
-                    time.sleep(1)
-                    continue
-                
-                client_socket, client_address = server_socket.accept()
-                logging.info(f"接受来自 {client_address} 的连接 (当前连接数: {self.current_connections+1}/{max_connections})")
-                
-                # 增加当前连接计数
-                self.current_connections += 1
-                
-                if self.use_ssl:
-                    try:
-                        client_socket = context.wrap_socket(client_socket, server_side=True)
-                    except ssl.SSLError as e:
-                        logging.error(f"SSL握手失败: {e}")
-                        client_socket.close()
+        try:
+            server_socket.bind((self.bind_host, self.bind_port))
+            server_socket.listen(10)  # 增加监听队列
+            
+            logging.info(f"控制服务器运行在 {self.bind_host}:{self.bind_port}")
+            
+            if self.use_ssl:
+                context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+                context.load_cert_chain(certfile=self.cert_file, keyfile=self.key_file)
+            
+            # 添加连接计数和限制
+            max_connections = 100  # 最大同时处理的连接数
+            
+            while self.running and not self.shutdown_event.is_set():
+                try:
+                    # 如果当前连接数达到上限，等待一段时间再接受新连接
+                    if self.current_connections >= max_connections:
+                        if self.shutdown_event.wait(1):
+                            break
                         continue
-                
-                # 设置客户端套接字的保活选项
-                client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
-                client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
-                client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6)
-                
-                # 创建新线程处理客户端连接，并传入连接计数的引用
-                client_thread = threading.Thread(
-                    target=_handle_client_connection_wrapper, 
-                    args=(client_socket, client_address)
-                )
-                client_thread.daemon = True
-                client_thread.start()
-                
-            except Exception as e:
-                logging.error(f"接受连接错误: {e}")
+                    
+                    client_socket, client_address = server_socket.accept()
+                    logging.info(f"接受来自 {client_address} 的连接 (当前连接数: {self.current_connections+1}/{max_connections})")
+                    
+                    # 增加当前连接计数
+                    self.current_connections += 1
+                    
+                    if self.use_ssl:
+                        try:
+                            client_socket = context.wrap_socket(client_socket, server_side=True)
+                        except ssl.SSLError as e:
+                            logging.error(f"SSL握手失败: {e}")
+                            client_socket.close()
+                            self.current_connections -= 1
+                            continue
+                    
+                    # 设置客户端套接字的保活选项
+                    client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    if hasattr(socket, 'TCP_KEEPIDLE'):
+                        client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+                        client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                        client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6)
+                    
+                    # 创建新线程处理客户端连接
+                    client_thread = threading.Thread(
+                        target=self._handle_client_connection_wrapper,
+                        args=(client_socket, client_address),
+                        name=f"Client-{client_address[0]}:{client_address[1]}"
+                    )
+                    client_thread.daemon = True
+                    client_thread.start()
+                    
+                except socket.timeout:
+                    continue  # 超时继续循环检查关闭事件
+                except Exception as e:
+                    if self.running and not self.shutdown_event.is_set():
+                        logging.error(f"接受连接错误: {e}")
+                        time.sleep(1)
+        except Exception as e:
+            logging.error(f"控制服务器启动失败: {e}")
+        finally:
+            try:
+                server_socket.close()
+            except:
+                pass
+            self.control_server_socket = None
+            logging.info("控制服务器已关闭")
+            
+    def _handle_client_connection_wrapper(self, client_socket, client_address):
+        """包装器函数，用于处理异常"""
+        try:
+            self.handle_client_connection(client_socket, client_address)
+        except Exception as e:
+            logging.error(f"处理客户端连接异常 {client_address}: {e}")
+        finally:
+            self.current_connections -= 1
+            logging.info(f"连接 {client_address} 已断开，当前连接数: {self.current_connections}")
+            try:
+                client_socket.close()
+            except:
+                pass
     
     def handle_client_connection(self, client_socket, client_address):
         tunnel_id = None
@@ -547,7 +641,7 @@ class TunnelServer:
     def run_http_server(self):
         """运行HTTP服务器，支持自动重启"""
         consecutive_failures = 0
-        max_consecutive_failures = 3
+        max_consecutive_failures = 5  # 增加到5次
         
         while self.running:
             try:
@@ -565,33 +659,53 @@ class TunnelServer:
                 server.serve_forever()
                 
                 # 如果到达这里，说明serve_forever()退出了
-                logging.warning("HTTP服务器意外退出，准备重启...")
+                if self.running:
+                    logging.warning("HTTP服务器意外退出，准备重启...")
+                else:
+                    logging.info("HTTP服务器正常关闭")
+                    break
                 
             except OSError as e:
                 consecutive_failures += 1
-                if e.errno == 98:  # 端口被占用
+                if e.errno == 98 or e.errno == 10048:  # 端口被占用 (Linux/Windows)
                     logging.error(f"HTTP端口被占用，尝试释放...")
-                    os.system(f"fuser -k {self.http_port}/tcp")
+                    # Windows版本的端口释放
+                    try:
+                        import subprocess
+                        result = subprocess.run(['netstat', '-ano'], capture_output=True, text=True)
+                        for line in result.stdout.split('\n'):
+                            if f':{self.http_port}' in line and 'LISTENING' in line:
+                                parts = line.split()
+                                if len(parts) >= 5:
+                                    pid = parts[-1]
+                                    try:
+                                        subprocess.run(['taskkill', '/F', '/PID', pid], check=True)
+                                        logging.info(f"已终止占用端口的进程 PID: {pid}")
+                                    except subprocess.CalledProcessError:
+                                        pass
+                    except Exception:
+                        pass
                     time.sleep(5)
                 else:
-                    logging.error(f"HTTP服务器OSError: {e}", exc_info=True)
-                    time.sleep(3)
+                    logging.error(f"HTTP服务器OSError: {e}")
+                    time.sleep(10)  # 增加等待时间
                 
             except Exception as e:
                 consecutive_failures += 1
-                logging.error(f"HTTP服务器异常: {e}", exc_info=True)
-                time.sleep(3)
+                logging.error(f"HTTP服务器异常: {e}")
+                time.sleep(10)  # 增加等待时间
             
             # 检查连续失败次数
             if consecutive_failures >= max_consecutive_failures:
-                logging.error(f"HTTP服务器连续失败{consecutive_failures}次，暂停重启")
-                time.sleep(30)  # 等待30秒后重置计数
+                logging.error(f"HTTP服务器连续失败{consecutive_failures}次，暂停重启60秒")
+                time.sleep(60)  # 等待60秒后重置计数
                 consecutive_failures = 0
             
             # 如果不是正常关闭，等待一段时间后重启
             if self.running:
-                logging.info("等待3秒后重启HTTP服务器...")
-                time.sleep(3)
+                wait_time = min(5 + consecutive_failures * 2, 30)  # 递增等待时间
+                logging.info(f"等待{wait_time}秒后重启HTTP服务器...")
+                time.sleep(wait_time)
         
         logging.info("HTTP服务器线程退出")
     
@@ -842,8 +956,43 @@ class TunnelServer:
             return None
     
     def stop(self):
-        self.running = False
+        """优雅关闭服务器"""
         logging.info("正在停止服务器...")
+        self.running = False
+        self.shutdown_event.set()
+        
+        # 关闭HTTP服务器
+        if hasattr(self, 'http_server_instance') and self.http_server_instance:
+            try:
+                self.http_server_instance.shutdown()
+                self.http_server_instance.server_close()
+                logging.info("HTTP服务器已关闭")
+            except Exception as e:
+                logging.warning(f"关闭HTTP服务器时出错: {e}")
+        
+        # 关闭控制服务器
+        if self.control_server_socket:
+            try:
+                self.control_server_socket.close()
+                logging.info("控制服务器socket已关闭")
+            except Exception as e:
+                logging.warning(f"关闭控制服务器时出错: {e}")
+        
+        # 关闭所有客户端连接
+        for tunnel_id, client_socket in list(self.tunnels.items()):
+            try:
+                client_socket.close()
+                logging.debug(f"已关闭隧道 {tunnel_id}")
+            except Exception as e:
+                logging.warning(f"关闭隧道 {tunnel_id} 时出错: {e}")
+        
+        # 清理数据结构
+        self.tunnels.clear()
+        self.domain_tunnels.clear()
+        self.pending_requests.clear()
+        self.client_last_seen.clear()
+        
+        logging.info("服务器停止完成")
 
 
     # 添加一个新方法用于注册子域名
@@ -853,22 +1002,7 @@ class TunnelServer:
         # 打印当前所有子域名映射，用于调试
         logging.info(f"当前子域名映射: {self.domain_tunnels}")
 
-    # 添加一个定期发送心跳的方法
-    def start_heartbeat(self, client_socket, tunnel_id):
-        def send_heartbeat():
-            while tunnel_id in self.tunnels and self.running:
-                try:
-                    heartbeat_msg = {"type": "heartbeat"}
-                    client_socket.sendall((json.dumps(heartbeat_msg) + '\n').encode('utf-8'))
-                    logging.debug(f"向隧道 {tunnel_id} 发送心跳")
-                    time.sleep(30)  # 每30秒发送一次心跳
-                except Exception as e:
-                    logging.error(f"发送心跳失败: {e}")
-                    break
-        
-        heartbeat_thread = threading.Thread(target=send_heartbeat)
-        heartbeat_thread.daemon = True
-        heartbeat_thread.start()
+
 
     def format_time_duration(self, seconds):
         """将秒数转换为天、小时、分钟、秒的格式"""
@@ -892,12 +1026,15 @@ class TunnelServer:
         
         return "".join(parts)
 
-    def start_connection_monitor(self):
+    def _start_connection_monitor(self):
+        """启动连接监控"""
         def monitor_connections():
-            while self.running:
+            while self.running and not self.shutdown_event.is_set():
                 try:
                     current_time = time.time()
                     
+                    # 清理僵尸连接
+                    dead_tunnels = []
                     for tunnel_id, client_socket in list(self.tunnels.items()):
                         last_seen = self.client_last_seen.get(tunnel_id, current_time)
                         idle_time = current_time - last_seen
@@ -909,7 +1046,7 @@ class TunnelServer:
                         )
                         
                         # 如果有正在处理的请求，延长检测时间
-                        timeout_threshold = 600 if has_pending_requests else 300  # 10分钟 vs 5分钟
+                        timeout_threshold = 600 if has_pending_requests else self.heartbeat_timeout
                         
                         if idle_time > timeout_threshold:
                             try:
@@ -918,7 +1055,7 @@ class TunnelServer:
                                 ping_msg = {"type": "ping", "timestamp": ping_timestamp}
                                 ping_json = json.dumps(ping_msg) + '\n'
                                 client_socket.sendall(ping_json.encode('utf-8'))
-                                logging.info(f"向隧道 {tunnel_id} 发送ping检测消息，时间戳: {ping_timestamp}")
+                                logging.debug(f"向隧道 {tunnel_id} 发送ping检测消息")
                                 
                                 # 等待一小段时间让客户端响应
                                 time.sleep(2)
@@ -927,20 +1064,26 @@ class TunnelServer:
                                 new_last_seen = self.client_last_seen.get(tunnel_id, last_seen)
                                 if new_last_seen <= last_seen:
                                     # 没有收到响应，可能是僵尸连接
-                                    logging.warning(f"检测到僵尸隧道: {tunnel_id} (ping无响应，发送时间: {ping_timestamp}，最后活跃: {last_seen})")
+                                    logging.warning(f"检测到僵尸隧道: {tunnel_id} (ping无响应)")
+                                    dead_tunnels.append(tunnel_id)
                                 else:
-                                    logging.info(f"隧道 {tunnel_id} ping检测正常，响应时间: {new_last_seen - ping_timestamp:.2f}秒")
+                                    logging.debug(f"隧道 {tunnel_id} ping检测正常")
                                     
                             except Exception as e:
                                 # 发送失败，标记为死连接
                                 logging.warning(f"检测到僵尸隧道: {tunnel_id} (ping发送失败: {e})")
+                                dead_tunnels.append(tunnel_id)
+                    
+                    # 清理僵尸连接
+                    for tunnel_id in dead_tunnels:
+                        self.cleanup_tunnel(tunnel_id)
                     
                     # 统计当前连接数
                     connection_count = len(self.tunnels)
-                    logging.info(f"当前活跃隧道数: {connection_count}")
-                    
-                    # 列出所有活跃隧道
                     if connection_count > 0:
+                        logging.info(f"当前活跃隧道数: {connection_count}")
+                        
+                        # 列出所有活跃隧道（只在调试模式下显示详细信息）
                         tunnel_info = []
                         for tunnel_id in self.tunnels:
                             last_seen = self.client_last_seen.get(tunnel_id, current_time)
@@ -951,20 +1094,26 @@ class TunnelServer:
                             else:
                                 formatted_time = self.format_time_duration(idle_time)
                             tunnel_info.append(f"{tunnel_id}(空闲{formatted_time})")
-                        logging.info(f"活跃隧道: {', '.join(tunnel_info)}")
+                        logging.debug(f"活跃隧道: {', '.join(tunnel_info)}")
                     
                     # 检查系统资源
-                    import os, psutil
-                    process = psutil.Process(os.getpid())
-                    mem_info = process.memory_info()
-                    logging.info(f"内存使用: {mem_info.rss / 1024 / 1024:.1f} MB")
+                    try:
+                        import psutil
+                        process = psutil.Process(os.getpid())
+                        mem_info = process.memory_info()
+                        logging.debug(f"内存使用: {mem_info.rss / 1024 / 1024:.1f} MB")
+                    except ImportError:
+                        pass  # psutil不可用时跳过内存检查
                     
-                    time.sleep(60)  # 每分钟检查一次
+                    # 等待60秒或关闭事件
+                    if self.shutdown_event.wait(60):
+                        break
                 except Exception as e:
                     logging.error(f"监控错误: {e}")
-                    time.sleep(60)
+                    if self.shutdown_event.wait(60):
+                        break
         
-        monitor_thread = threading.Thread(target=monitor_connections)
+        monitor_thread = threading.Thread(target=monitor_connections, name="ConnectionMonitor")
         monitor_thread.daemon = True
         monitor_thread.start()
 

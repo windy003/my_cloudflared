@@ -12,6 +12,9 @@ import argparse
 import logging
 from urllib.parse import urlparse
 import uuid
+import select
+import signal
+import sys
 
 # 配置日志
 logging.basicConfig(
@@ -38,189 +41,317 @@ class TunnelClient:
         self.use_ssl = use_ssl
         self.running = False
         self.control_socket = None
-        self.reconnect_delay = 5  # 初始重连延迟改为5秒
-        self.max_reconnect_delay = 300  # 最大重连延迟5分钟
+        self.reconnect_delay = 10  # 初始重连延迟改为10秒
+        self.max_reconnect_delay = 180  # 最大重连延迟3分钟
         self.reconnect_attempts = 0  # 重连尝试次数
-        self.max_reconnect_attempts = 10  # 最大连续重连尝试次数
+        self.max_reconnect_attempts = 15  # 最大连续重连尝试次数
+        self.last_heartbeat_received = time.time()  # 最后收到心跳的时间
+        self.heartbeat_timeout = 120  # 心跳超时时间增加到2分钟
+        self.heartbeat_thread = None
+        self.message_handler_thread = None
+        self.connection_lock = threading.Lock()  # 连接锁
+        self.shutdown_event = threading.Event()  # 优雅关闭事件
+        
+        # 注册信号处理器
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        
+    def _signal_handler(self, signum, frame):
+        """处理信号，优雅关闭"""
+        logging.info(f"收到信号 {signum}，开始优雅关闭...")
+        self.stop()
         
     def start(self):
         self.running = True
+        self.shutdown_event.clear()
+        logging.info("客户端启动中...")
         self.connect_to_server()
         
     def connect_to_server(self):
-        while self.running:
+        while self.running and not self.shutdown_event.is_set():
             try:
-                # 重连时生成新的隧道ID（保留子域名）
-                if self.reconnect_attempts > 0:
-                    base_id = self.subdomain if self.subdomain else "tunnel"
-                    self.tunnel_id = f"{base_id}_{int(time.time())}"
-                    logging.info(f"重连使用新隧道ID: {self.tunnel_id}")
-                
-                # 创建到服务器的控制连接
-                logging.info(f"正在连接到服务器 {self.server_host}:{self.server_port}...")
-                
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                
-                # 设置socket选项提高稳定性
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                
-                # Windows特定的keepalive设置
-                if hasattr(socket, 'TCP_KEEPIDLE'):
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-                
-                sock.settimeout(15)  # 增加连接超时时间到15秒
-                
-                try:
-                    # 创建SSL上下文
-                    context = ssl.create_default_context()
-                    context.check_hostname = False
-                    context.verify_mode = ssl.CERT_NONE
-                    context.minimum_version = ssl.TLSVersion.TLSv1_2  # 设置最低支持的TLS版本
-                    context.maximum_version = ssl.TLSVersion.TLSv1_3  # 设置最高支持的TLS版本
-                    # 包装为SSL连接
-                    sock = context.wrap_socket(sock, server_hostname=self.server_host)
+                with self.connection_lock:
+                    # 重连时生成新的隧道ID（保留子域名）
+                    if self.reconnect_attempts > 0:
+                        base_id = self.subdomain if self.subdomain else "tunnel"
+                        self.tunnel_id = f"{base_id}_{int(time.time())}"
+                        logging.info(f"重连使用新隧道ID: {self.tunnel_id}")
                     
-                    # 尝试连接
-                    sock.connect((self.server_host, self.server_port))
+                    # 清理之前的连接
+                    self._cleanup_connection()
+                    
+                    # 创建到服务器的控制连接
+                    logging.info(f"正在连接到服务器 {self.server_host}:{self.server_port}...")
+                    
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    
+                    # 设置socket选项提高稳定性
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6)
                     
-                    logging.info("成功连接到服务器")
+                    # 设置keepalive参数
+                    if hasattr(socket, 'TCP_KEEPIDLE'):
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
                     
-                    # 连接成功后重置超时设置
-                    sock.settimeout(None)
-                    self.control_socket = sock
+                    sock.settimeout(30)  # 连接超时30秒
                     
-                    # 发送注册信息
-                    registration = {
-                        "type": "register",
-                        "tunnel_id": self.tunnel_id
-                    }
-                    
-                    # 如果设置了子域名，添加到注册信息中
-                    if self.subdomain:
-                        registration["subdomain"] = self.subdomain
-                    
-                    # 直接发送，不使用send_message方法
-                    registration_json = json.dumps(registration) 
-                    logging.info(f"发送注册消息: {registration_json}")
-                    
-                    # 确保消息以换行符结束
-                    if not registration_json.endswith('\n'):
-                        registration_json += '\n'
-                        
-                    # 发送消息
-                    self.control_socket.sendall(registration_json.encode('utf-8'))
-                    logging.info(f"注册消息已发送，等待服务器响应...")
-                    
-                    # 发送一个心跳消息，确保服务器处理了注册消息
-                    time.sleep(0.5)  # 等待500毫秒
-                    heartbeat = {"type": "heartbeat"}
-                    heartbeat_json = json.dumps(heartbeat) + '\n'
-                    self.control_socket.sendall(heartbeat_json.encode('utf-8'))
-                    logging.info("发送心跳消息")
-                    
-                    # 主循环 - 处理服务器发来的请求
-                    self.handle_server_messages()
-                    
-                    # 在 connect_to_server 方法中，连接成功后启动心跳线程
-                    self.start_heartbeat()
-                    
-                    # 连接成功，重置重连参数
-                    self.reconnect_delay = 5
-                    self.reconnect_attempts = 0
-                    
-                except socket.error as e:
-                    logging.error(f"连接失败: {e}")
-                    if self.control_socket:
-                        self.control_socket.close()
-                        self.control_socket = None
-                    sock.close()
-                    
-            except Exception as e:
-                logging.error(f"连接过程错误: {e}")
-                self.reconnect_attempts += 1
-                
-                # 指数退避算法
-                if self.reconnect_attempts <= self.max_reconnect_attempts:
-                    current_delay = min(self.reconnect_delay * (2 ** (self.reconnect_attempts - 1)), self.max_reconnect_delay)
-                    logging.info(f"第 {self.reconnect_attempts} 次重连失败，将在 {current_delay} 秒后重试")
-                    time.sleep(current_delay)
-                else:
-                    logging.error(f"连续重连失败 {self.max_reconnect_attempts} 次，等待 {self.max_reconnect_delay} 秒后重置")
-                    time.sleep(self.max_reconnect_delay)
-                    self.reconnect_attempts = 0
-            
-            finally:
-                if self.control_socket:
                     try:
-                        self.control_socket.close()
-                    except:
-                        pass
-                    self.control_socket = None
-    
-    def send_message(self, message):
-        """安全地发送消息到服务器"""
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                if not self.control_socket:
-                    logging.error("控制连接不存在")
-                    return False
-                
-                message_json = json.dumps(message)
-                if not message_json.endswith('\n'):
-                    message_json += '\n'
-                
-                self.control_socket.sendall(message_json.encode('utf-8'))
-                return True
-            except Exception as e:
-                logging.error(f"发送消息错误 (尝试 {attempt + 1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(0.5)  # 短暂等待后重试
-                else:
-                    # 最后一次尝试失败，标记连接需要重建
-                    self.running = False
-                    return False
-    
-    def handle_server_messages(self):
-        buffer = b''
-        
-        while self.running:
-            try:
-                # 设置接收超时为30秒
-                self.control_socket.settimeout(30)
-                data = self.control_socket.recv(4096)
-                
-                if not data:
-                    logging.warning("服务器连接已关闭")
-                    break
-                
-                buffer += data
-                
-                # 处理可能的多条消息
-                while b'\n' in buffer:
-                    message, buffer = buffer.split(b'\n', 1)
-                    if message:
-                        try:
-                            self.process_message(message.decode('utf-8'))
-                        except Exception as e:
-                            logging.error(f"处理单条消息错误: {e}")
-                            # 不要因为单条消息处理错误就断开连接
+                        if self.use_ssl:
+                            # 创建SSL上下文
+                            context = ssl.create_default_context()
+                            context.check_hostname = False
+                            context.verify_mode = ssl.CERT_NONE
+                            context.minimum_version = ssl.TLSVersion.TLSv1_2
+                            context.maximum_version = ssl.TLSVersion.TLSv1_3
+                            # 包装为SSL连接
+                            sock = context.wrap_socket(sock, server_hostname=self.server_host)
+                        
+                        # 尝试连接
+                        sock.connect((self.server_host, self.server_port))
+                        
+                        # 连接成功后设置socket参数
+                        if hasattr(socket, 'TCP_KEEPIDLE'):
+                            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6)
+                        
+                        logging.info("成功连接到服务器")
+                        
+                        # 连接成功后重置超时设置
+                        sock.settimeout(None)
+                        self.control_socket = sock
+                        
+                        # 发送注册信息
+                        if not self._register_with_server():
+                            logging.error("注册失败，重新连接")
                             continue
                         
-            except socket.timeout:
-                # 超时不一定是错误，继续循环
-                logging.debug("接收数据超时，继续等待")
-                continue
+                        # 连接成功，重置重连参数
+                        self.reconnect_delay = 5
+                        self.reconnect_attempts = 0
+                        self.last_heartbeat_received = time.time()
+                        
+                        # 启动心跳线程
+                        self._start_heartbeat_thread()
+                        
+                        # 启动消息处理线程
+                        self._start_message_handler_thread()
+                        
+                        # 等待连接断开
+                        self._wait_for_disconnection()
+                        
+                    except (socket.error, ssl.SSLError) as e:
+                        logging.error(f"连接失败: {e}")
+                        if self.control_socket:
+                            try:
+                                self.control_socket.close()
+                            except:
+                                pass
+                            self.control_socket = None
+                        
             except Exception as e:
-                logging.error(f"接收消息错误: {e}")
+                logging.error(f"连接过程错误: {e}")
+                
+            finally:
+                self._cleanup_connection()
+                
+            # 如果仍在运行，准备重连
+            if self.running and not self.shutdown_event.is_set():
+                self.reconnect_attempts += 1
+                
+                # 改进的重连算法
+                if self.reconnect_attempts <= self.max_reconnect_attempts:
+                    # 使用更温和的退避策略
+                    current_delay = min(self.reconnect_delay + (self.reconnect_attempts - 1) * 5, self.max_reconnect_delay)
+                    logging.info(f"第 {self.reconnect_attempts} 次重连失败，将在 {current_delay} 秒后重试")
+                    if self.shutdown_event.wait(current_delay):
+                        break  # 收到关闭信号
+                else:
+                    logging.error(f"连续重连失败 {self.max_reconnect_attempts} 次，等待 {self.max_reconnect_delay} 秒后重置")
+                    if self.shutdown_event.wait(self.max_reconnect_delay):
+                        break  # 收到关闭信号
+                    self.reconnect_attempts = 0
+    
+    def _register_with_server(self):
+        """向服务器注册"""
+        try:
+            registration = {
+                "type": "register",
+                "tunnel_id": self.tunnel_id
+            }
+            
+            # 如果设置了子域名，添加到注册信息中
+            if self.subdomain:
+                registration["subdomain"] = self.subdomain
+            
+            registration_json = json.dumps(registration) + '\n'
+            logging.info(f"发送注册消息: {registration}")
+            
+            self.control_socket.sendall(registration_json.encode('utf-8'))
+            logging.info("注册消息已发送，等待服务器响应...")
+            
+            # 等待一下确保注册处理完成
+            time.sleep(1)
+            return True
+            
+        except Exception as e:
+            logging.error(f"注册失败: {e}")
+            return False
+    
+    def _start_heartbeat_thread(self):
+        """启动心跳线程"""
+        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+            return
+            
+        def heartbeat_worker():
+            heartbeat_interval = 30  # 30秒发送一次心跳
+            heartbeat_count = 0
+            
+            logging.info(f"心跳线程启动，间隔: {heartbeat_interval}秒")
+            
+            while self.running and not self.shutdown_event.is_set() and self.control_socket:
+                try:
+                    # 检查心跳超时
+                    current_time = time.time()
+                    if current_time - self.last_heartbeat_received > self.heartbeat_timeout:
+                        logging.warning(f"心跳超时，最后心跳时间: {self.last_heartbeat_received}, 当前时间: {current_time}")
+                        break
+                    
+                    # 发送心跳
+                    heartbeat_count += 1
+                    heartbeat = {
+                        "type": "heartbeat", 
+                        "timestamp": current_time,
+                        "count": heartbeat_count
+                    }
+                    
+                    if self._send_message_safe(heartbeat):
+                        logging.debug(f"发送心跳消息 #{heartbeat_count}")
+                    else:
+                        logging.error("心跳发送失败")
+                        break
+                    
+                    # 等待下次心跳或关闭事件
+                    if self.shutdown_event.wait(heartbeat_interval):
+                        break
+                        
+                except Exception as e:
+                    logging.error(f"心跳线程错误: {e}")
+                    break
+            
+            logging.info("心跳线程结束")
+        
+        self.heartbeat_thread = threading.Thread(target=heartbeat_worker)
+        self.heartbeat_thread.daemon = True
+        self.heartbeat_thread.start()
+    
+    def _start_message_handler_thread(self):
+        """启动消息处理线程"""
+        if self.message_handler_thread and self.message_handler_thread.is_alive():
+            return
+            
+        def message_handler_worker():
+            logging.info("消息处理线程启动")
+            buffer = b''
+            
+            while self.running and not self.shutdown_event.is_set() and self.control_socket:
+                try:
+                    # 使用select检查socket可读性
+                    ready, _, error = select.select([self.control_socket], [], [self.control_socket], 1)
+                    
+                    if error:
+                        logging.error("Socket出现错误")
+                        break
+                    
+                    if not ready:
+                        continue  # 超时，继续循环
+                    
+                    # 接收数据
+                    data = self.control_socket.recv(4096)
+                    
+                    if not data:
+                        logging.warning("服务器连接已关闭")
+                        break
+                    
+                    buffer += data
+                    
+                    # 处理可能的多条消息
+                    while b'\n' in buffer:
+                        message, buffer = buffer.split(b'\n', 1)
+                        if message:
+                            try:
+                                self.process_message(message.decode('utf-8'))
+                            except Exception as e:
+                                logging.error(f"处理单条消息错误: {e}")
+                                continue
+                            
+                except Exception as e:
+                    logging.error(f"接收消息错误: {e}")
+                    break
+            
+            logging.info("消息处理线程结束")
+        
+        self.message_handler_thread = threading.Thread(target=message_handler_worker)
+        self.message_handler_thread.daemon = True
+        self.message_handler_thread.start()
+    
+    def _wait_for_disconnection(self):
+        """等待连接断开"""
+        while self.running and not self.shutdown_event.is_set() and self.control_socket:
+            # 检查线程状态
+            if self.heartbeat_thread and not self.heartbeat_thread.is_alive():
+                logging.warning("心跳线程已停止")
                 break
+                
+            if self.message_handler_thread and not self.message_handler_thread.is_alive():
+                logging.warning("消息处理线程已停止")
+                break
+            
+            # 检查心跳超时
+            if time.time() - self.last_heartbeat_received > self.heartbeat_timeout:
+                logging.warning("心跳超时，准备重连")
+                break
+            
+            time.sleep(1)
+    
+    def _cleanup_connection(self):
+        """清理连接资源"""
+        if self.control_socket:
+            try:
+                self.control_socket.close()
+            except:
+                pass
+            self.control_socket = None
+        
+        # 等待线程结束
+        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+            self.heartbeat_thread.join(timeout=2)
+            
+        if self.message_handler_thread and self.message_handler_thread.is_alive():
+            self.message_handler_thread.join(timeout=2)
+    
+    def _send_message_safe(self, message):
+        """安全地发送消息到服务器"""
+        try:
+            if not self.control_socket:
+                return False
+            
+            message_json = json.dumps(message)
+            if not message_json.endswith('\n'):
+                message_json += '\n'
+            
+            self.control_socket.sendall(message_json.encode('utf-8'))
+            return True
+        except Exception as e:
+            logging.error(f"发送消息错误: {e}")
+            return False
+    
+    def send_message(self, message):
+        """安全地发送消息到服务器（向后兼容）"""
+        return self._send_message_safe(message)
     
     def process_message(self, message_str):
         try:
@@ -237,7 +368,8 @@ class TunnelClient:
                 ).start()
             elif message_type == "heartbeat":
                 # 处理服务器发送的心跳消息
-                logging.info(f"收到服务器心跳消息，时间戳: {message.get('timestamp', 'N/A')}")
+                logging.debug(f"收到服务器心跳消息，时间戳: {message.get('timestamp', 'N/A')}")
+                self.last_heartbeat_received = time.time() # 更新最后收到心跳的时间
                 # 发送心跳响应
                 heartbeat_response = {
                     "type": "heartbeat_response",
@@ -245,16 +377,18 @@ class TunnelClient:
                     "original_timestamp": message.get('timestamp')
                 }
                 self.send_message(heartbeat_response)
-                logging.info("发送心跳响应到服务器")
+                logging.debug("发送心跳响应到服务器")
             elif message_type == "heartbeat_response":
                 # 处理服务器的心跳响应
                 server_time = message.get('server_time', 'N/A')
                 server_timestamp = message.get('timestamp', 'N/A')
-                logging.info(f"收到服务器心跳响应，服务器时间: {server_time}，时间戳: {server_timestamp}")
+                self.last_heartbeat_received = time.time() # 更新最后收到心跳的时间
+                logging.debug(f"收到服务器心跳响应，服务器时间: {server_time}，时间戳: {server_timestamp}")
             elif message_type == "ping":
                 # 处理服务器的ping消息
                 ping_timestamp = message.get('timestamp', 'N/A')
-                logging.info(f"收到服务器ping消息，时间戳: {ping_timestamp}")
+                self.last_heartbeat_received = time.time() # 更新最后收到心跳的时间
+                logging.debug(f"收到服务器ping消息，时间戳: {ping_timestamp}")
                 # 发送pong响应
                 pong_response = {
                     "type": "pong",
@@ -262,19 +396,20 @@ class TunnelClient:
                     "original_timestamp": ping_timestamp
                 }
                 self.send_message(pong_response)
-                logging.info(f"发送pong响应到服务器，原始时间戳: {ping_timestamp}")
+                logging.debug(f"发送pong响应到服务器，原始时间戳: {ping_timestamp}")
             elif message_type == "pong":
                 # 处理服务器的pong响应
                 original_timestamp = message.get('original_timestamp', 'N/A')
                 response_timestamp = message.get('timestamp', 'N/A')
+                self.last_heartbeat_received = time.time() # 更新最后收到心跳的时间
                 if original_timestamp != 'N/A' and response_timestamp != 'N/A':
                     try:
                         rtt = float(response_timestamp) - float(original_timestamp)
                         logging.info(f"收到服务器pong响应，往返时间: {rtt:.3f}秒")
                     except:
-                        logging.info(f"收到服务器pong响应，原始时间戳: {original_timestamp}")
+                        logging.debug(f"收到服务器pong响应，原始时间戳: {original_timestamp}")
                 else:
-                    logging.info("收到服务器pong响应")
+                    logging.debug("收到服务器pong响应")
             else:
                 logging.warning(f"收到未知类型的消息: {message_type}")
         except json.JSONDecodeError as e:
@@ -284,6 +419,8 @@ class TunnelClient:
     
     def handle_request(self, request_id, data):
         local_socket = None
+        start_time = time.time()
+        
         try:
             # 确保data是字典类型
             if isinstance(data, str):
@@ -305,8 +442,11 @@ class TunnelClient:
             # 连接到本地服务
             logging.info(f"连接本地服务 {self.local_host}:{self.local_port}")
             local_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            local_socket.settimeout(180)  # 改为180秒(3分钟)连接超时
+            local_socket.settimeout(30)  # 连接超时30秒
             local_socket.connect((self.local_host, self.local_port))
+            
+            # 连接成功后设置更长的数据传输超时
+            local_socket.settimeout(300)  # 5分钟数据传输超时
             
             # 构建HTTP请求
             request_str = f"{method} {path} HTTP/1.1\r\n"
@@ -342,46 +482,59 @@ class TunnelClient:
             self.send_progress_update(request_id, "开始爬虫任务")
             
             # 接收响应
-            logging.info(f"等待本地爬虫服务响应")
+            logging.info(f"等待本地服务响应")
             response = b""
-            start_time = time.time()
             last_progress_time = time.time()
+            timeout_count = 0
+            max_timeouts = 10  # 最多允许10次超时
             
             while True:
                 try:
                     current_time = time.time()
                     elapsed = int(current_time - start_time)
                     
-                    # 每30秒发送一次进度更新，包含更详细信息
+                    # 每30秒发送一次进度更新
                     if current_time - last_progress_time > 30:
                         data_received = len(response)
                         self.send_progress_update(request_id, 
-                            f"爬虫运行中... 已耗时{elapsed}秒，已接收数据{data_received}字节")
+                            f"任务运行中... 已耗时{elapsed}秒，已接收数据{data_received}字节")
                         last_progress_time = current_time
                     
+                    # 检查总运行时间
+                    if elapsed > 600:  # 10分钟总超时
+                        logging.warning(f"任务总超时，已运行{elapsed}秒")
+                        self.send_progress_update(request_id, f"任务总超时，已运行{elapsed}秒")
+                        break
+                    
+                    # 设置接收超时
                     local_socket.settimeout(30)
-                    chunk = local_socket.recv(4096)
+                    chunk = local_socket.recv(8192)  # 增加缓冲区大小
                     
                     if not chunk:
                         logging.info(f"本地服务连接关闭，总共接收{len(response)}字节")
                         break
                     response += chunk
+                    timeout_count = 0  # 收到数据后重置超时计数
                     
                 except socket.timeout:
                     elapsed = int(time.time() - start_time)
-                    # 检查总时间
-                    if elapsed > 300:  # 5分钟
-                        logging.warning(f"爬虫任务超时，已运行{elapsed}秒")
-                        self.send_progress_update(request_id, f"爬虫任务超时，已运行{elapsed}秒")
+                    timeout_count += 1
+                    
+                    if timeout_count >= max_timeouts:
+                        logging.warning(f"连续超时{max_timeouts}次，放弃等待，已运行{elapsed}秒")
+                        self.send_progress_update(request_id, f"连续超时{max_timeouts}次，已运行{elapsed}秒")
                         break
                     else:
-                        # 继续等待，但记录状态
-                        logging.debug(f"等待爬虫数据中... 已运行{elapsed}秒")
+                        logging.debug(f"等待数据中... 已运行{elapsed}秒 (超时次数: {timeout_count}/{max_timeouts})")
                         continue
+                except Exception as e:
+                    logging.error(f"接收数据时出错: {e}")
+                    break
             
-            # 爬虫完成
+            # 任务完成
             elapsed = int(time.time() - start_time)
-            self.send_progress_update(request_id, f"爬虫任务完成，耗时{elapsed}秒")
+            data_size = len(response)
+            self.send_progress_update(request_id, f"任务完成，耗时{elapsed}秒，接收{data_size}字节")
             
             if not response:
                 logging.warning("本地服务没有返回响应")
@@ -494,47 +647,32 @@ class TunnelClient:
             }
     
     def stop(self):
+        """优雅关闭客户端"""
+        logging.info("正在停止客户端...")
         self.running = False
+        self.shutdown_event.set()
+        
+        # 等待线程结束
+        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+            logging.debug("等待心跳线程结束...")
+            self.heartbeat_thread.join(timeout=3)
+            
+        if self.message_handler_thread and self.message_handler_thread.is_alive():
+            logging.debug("等待消息处理线程结束...")
+            self.message_handler_thread.join(timeout=3)
+        
+        # 关闭socket连接
         if self.control_socket:
             try:
                 self.control_socket.close()
+                logging.debug("控制连接已关闭")
             except:
                 pass
-
-    def start_heartbeat(self):
-        def send_heartbeat():
-            heartbeat_interval = 20  # 20秒发送一次心跳
-            last_heartbeat_time = time.time()
-            heartbeat_count = 0
-            
-            logging.info(f"心跳线程启动，间隔: {heartbeat_interval}秒")
-            
-            while self.running and self.control_socket:
-                try:
-                    current_time = time.time()
-                    if current_time - last_heartbeat_time >= heartbeat_interval:
-                        heartbeat_count += 1
-                        heartbeat_timestamp = current_time
-                        heartbeat = {
-                            "type": "heartbeat", 
-                            "timestamp": heartbeat_timestamp,
-                            "count": heartbeat_count
-                        }
-                        heartbeat_json = json.dumps(heartbeat) + '\n'
-                        self.control_socket.sendall(heartbeat_json.encode('utf-8'))
-                        logging.info(f"发送心跳消息 #{heartbeat_count}，时间戳: {heartbeat_timestamp}")
-                        last_heartbeat_time = current_time
-                    
-                    time.sleep(5)  # 每5秒检查一次
-                except Exception as e:
-                    logging.error(f"发送心跳失败: {e}")
-                    break
-            
-            logging.info("心跳线程结束")
+            self.control_socket = None
         
-        heartbeat_thread = threading.Thread(target=send_heartbeat)
-        heartbeat_thread.daemon = True
-        heartbeat_thread.start()
+        logging.info("客户端停止完成")
+
+
 
 
     def send_progress_update(self, request_id, message):
