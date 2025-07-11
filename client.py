@@ -628,13 +628,32 @@ class TunnelClient:
                 if ':' in line:
                     name, value = line.split(':', 1)
                     headers[name.strip()] = value.strip()
-                    
+            
+            # 判断是否为二进制内容
+            content_type = headers.get('Content-Type', '').lower()
+            is_binary = any(binary_type in content_type for binary_type in [
+                'image/', 'video/', 'audio/', 'application/octet-stream',
+                'application/pdf', 'application/zip', 'font/'
+            ])
+            
             # 构建响应对象
-            response_obj = {
-                "status": status_code,
-                "headers": headers,
-                "body": body.decode('utf-8', errors='replace')
-            }
+            if is_binary:
+                # 对于二进制数据，使用base64编码
+                import base64
+                response_obj = {
+                    "status": status_code,
+                    "headers": headers,
+                    "body": base64.b64encode(body).decode('ascii'),
+                    "is_binary": True
+                }
+            else:
+                # 对于文本数据，正常解码
+                response_obj = {
+                    "status": status_code,
+                    "headers": headers,
+                    "body": body.decode('utf-8', errors='replace'),
+                    "is_binary": False
+                }
             
             return response_obj
         except Exception as e:
@@ -643,7 +662,8 @@ class TunnelClient:
             return {
                 "status": 200,
                 "headers": {"Content-Type": "text/plain"},
-                "body": response_bytes.decode('utf-8', errors='replace')
+                "body": response_bytes.decode('utf-8', errors='replace'),
+                "is_binary": False
             }
     
     def stop(self):

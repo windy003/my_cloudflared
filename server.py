@@ -817,25 +817,33 @@ class TunnelServer:
                         status_code = resp_data.get("status", 200)
                         headers = resp_data.get("headers", {})
                         body = resp_data.get("body", "")
+                        is_binary = resp_data.get("is_binary", False)
                         
-                        # 确保Content-Type指定了字符集
-                        if "Content-Type" in headers and "charset" not in headers["Content-Type"]:
+                        # 对于文本内容，确保Content-Type指定了字符集
+                        if not is_binary and "Content-Type" in headers and "charset" not in headers["Content-Type"]:
                             if "text/html" in headers["Content-Type"]:
                                 headers["Content-Type"] = "text/html; charset=utf-8"
                             elif "text/plain" in headers["Content-Type"]:
                                 headers["Content-Type"] = "text/plain; charset=utf-8"
                         
                         # 发送响应
-                        logging.info(f"发送响应: 状态码 {status_code}")
+                        logging.info(f"发送响应: 状态码 {status_code}, 二进制: {is_binary}")
                         self.send_response(status_code)
                         for name, value in headers.items():
                             self.send_header(name, value)
                         self.end_headers()
                         
                         if body:
-                            # 确保以UTF-8编码发送
-                            self.wfile.write(body.encode('utf-8', errors='replace'))
-                            logging.info(f"响应体已发送，长度: {len(body)}")
+                            if is_binary:
+                                # 对于二进制数据，从base64解码后发送
+                                import base64
+                                binary_data = base64.b64decode(body)
+                                self.wfile.write(binary_data)
+                                logging.info(f"二进制响应体已发送，长度: {len(binary_data)}")
+                            else:
+                                # 对于文本数据，以UTF-8编码发送
+                                self.wfile.write(body.encode('utf-8', errors='replace'))
+                                logging.info(f"文本响应体已发送，长度: {len(body)}")
                         
                     except Exception as e:
                         logging.error(f"解析响应数据失败: {e}")
