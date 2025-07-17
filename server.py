@@ -44,9 +44,9 @@ class TunnelServer:
         self.pending_requests = {}  # request_id -> response_event, response_data
         self.running = False
         self.client_last_seen = {}  # 记录客户端最后活跃时间
-        self.heartbeat_timeout = 120  # 心跳超时时间（秒）增加到2分钟
+        self.heartbeat_timeout = 180  # 心跳超时时间（秒）增加到3分钟
         self.current_connections = 0  # 改为实例变量
-        self.timeout = 180  # 增加超时时间到3分钟
+        self.timeout = 300  # 增加超时时间到5分钟
         self.shutdown_event = threading.Event()  # 优雅关闭事件
         self.http_server_instance = None
         self.control_server_socket = None
@@ -193,9 +193,9 @@ class TunnelServer:
                         logging.warning(status_msg)
                         consecutive_failures += 1
                         
-                        # 如果连续失败5次，尝试重启HTTP服务器
-                        if consecutive_failures >= 5:
-                            logging.error("HTTP服务器连续失败5次，尝试重启...")
+                        # 如果连续失败3次，尝试重启HTTP服务器
+                        if consecutive_failures >= 3:
+                            logging.error("HTTP服务器连续失败3次，尝试重启...")
                             self.restart_http_server()
                             consecutive_failures = 0  # 重置计数
                     
@@ -641,7 +641,7 @@ class TunnelServer:
     def run_http_server(self):
         """运行HTTP服务器，支持自动重启"""
         consecutive_failures = 0
-        max_consecutive_failures = 5  # 增加到5次
+        max_consecutive_failures = 3  # 改为3次，更快重启
         
         while self.running:
             try:

@@ -41,12 +41,12 @@ class TunnelClient:
         self.use_ssl = use_ssl
         self.running = False
         self.control_socket = None
-        self.reconnect_delay = 10  # 初始重连延迟改为10秒
-        self.max_reconnect_delay = 180  # 最大重连延迟3分钟
+        self.reconnect_delay = 5  # 初始重连延迟改为5秒
+        self.max_reconnect_delay = 60  # 最大重连延迟1分钟
         self.reconnect_attempts = 0  # 重连尝试次数
-        self.max_reconnect_attempts = 15  # 最大连续重连尝试次数
+        self.max_reconnect_attempts = 999  # 无限重连
         self.last_heartbeat_received = time.time()  # 最后收到心跳的时间
-        self.heartbeat_timeout = 120  # 心跳超时时间增加到2分钟
+        self.heartbeat_timeout = 180  # 心跳超时时间增加到3分钟
         self.heartbeat_thread = None
         self.message_handler_thread = None
         self.connection_lock = threading.Lock()  # 连接锁
@@ -89,11 +89,15 @@ class TunnelClient:
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                     
-                    # 设置keepalive参数
+                    # 设置keepalive参数（Windows兼容）
                     if hasattr(socket, 'TCP_KEEPIDLE'):
-                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
-                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
-                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                        try:
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                        except OSError:
+                            # Windows上可能不支持这些选项
+                            pass
                     
                     sock.settimeout(30)  # 连接超时30秒
                     
@@ -111,12 +115,16 @@ class TunnelClient:
                         # 尝试连接
                         sock.connect((self.server_host, self.server_port))
                         
-                        # 连接成功后设置socket参数
+                        # 连接成功后设置socket参数（Windows兼容）
                         if hasattr(socket, 'TCP_KEEPIDLE'):
-                            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
-                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
-                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6)
+                            try:
+                                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+                                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6)
+                            except OSError:
+                                # Windows上可能不支持这些选项
+                                pass
                         
                         logging.info("成功连接到服务器")
                         
@@ -162,18 +170,16 @@ class TunnelClient:
             if self.running and not self.shutdown_event.is_set():
                 self.reconnect_attempts += 1
                 
-                # 改进的重连算法
-                if self.reconnect_attempts <= self.max_reconnect_attempts:
-                    # 使用更温和的退避策略
-                    current_delay = min(self.reconnect_delay + (self.reconnect_attempts - 1) * 5, self.max_reconnect_delay)
-                    logging.info(f"第 {self.reconnect_attempts} 次重连失败，将在 {current_delay} 秒后重试")
-                    if self.shutdown_event.wait(current_delay):
-                        break  # 收到关闭信号
+                # 改进的重连算法 - 无限重连
+                # 使用指数退避策略，但有最大延迟限制
+                if self.reconnect_attempts <= 5:
+                    current_delay = min(self.reconnect_delay * (2 ** (self.reconnect_attempts - 1)), self.max_reconnect_delay)
                 else:
-                    logging.error(f"连续重连失败 {self.max_reconnect_attempts} 次，等待 {self.max_reconnect_delay} 秒后重置")
-                    if self.shutdown_event.wait(self.max_reconnect_delay):
-                        break  # 收到关闭信号
-                    self.reconnect_attempts = 0
+                    current_delay = self.max_reconnect_delay
+                
+                logging.info(f"第 {self.reconnect_attempts} 次重连失败，将在 {current_delay} 秒后重试")
+                if self.shutdown_event.wait(current_delay):
+                    break  # 收到关闭信号
     
     def _register_with_server(self):
         """向服务器注册"""
