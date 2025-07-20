@@ -174,6 +174,11 @@ class TunnelClient:
                         self.last_heartbeat_received = time.time()
                         logging.info(f"连接成功 (第{self.successful_connections}次成功连接)")
                         
+                        # 输出当前状态信息
+                        logging.info(f"隧道已建立: {self.tunnel_id}")
+                        if self.subdomain:
+                            logging.info(f"访问地址: https://{self.subdomain}.windy.run")
+                        
                         # 启动心跳线程
                         self._start_heartbeat_thread()
                         
@@ -241,7 +246,7 @@ class TunnelClient:
             return
             
         def heartbeat_worker():
-            heartbeat_interval = 30  # 30秒发送一次心跳
+            heartbeat_interval = 20  # 20秒发送一次心跳（提高检测频率）
             heartbeat_count = 0
             
             logging.info(f"心跳线程启动，间隔: {heartbeat_interval}秒")
@@ -250,7 +255,7 @@ class TunnelClient:
                 try:
                     # 检查心跳超时
                     current_time = time.time()
-                    if current_time - self.last_heartbeat_received > self.heartbeat_timeout:
+                    if current_time - self.last_heartbeat_received > 60:  # 60秒心跳超时
                         logging.warning(f"心跳超时，最后心跳时间: {self.last_heartbeat_received}, 当前时间: {current_time}")
                         break
                     
@@ -735,15 +740,15 @@ class TunnelClient:
         """智能计算重连延迟时间"""
         current_time = time.time()
         
-        # 基础指数退避策略
-        if self.reconnect_attempts <= 5:
-            base_delay = min(self.reconnect_delay * (2 ** (self.reconnect_attempts - 1)), 60)
-        elif self.reconnect_attempts <= 20:
-            base_delay = 60  # 前20次失败后固定1分钟
-        elif self.reconnect_attempts <= 50:
-            base_delay = 120  # 21-50次失败后固定2分钟
+        # 优化的重连策略 - 更快的恢复
+        if self.reconnect_attempts <= 3:
+            base_delay = min(self.reconnect_delay * (self.reconnect_attempts), 15)  # 5, 10, 15秒
+        elif self.reconnect_attempts <= 10:
+            base_delay = 30  # 4-10次失败后30秒
+        elif self.reconnect_attempts <= 30:
+            base_delay = 60  # 11-30次失败后1分钟
         else:
-            base_delay = self.max_reconnect_delay  # 50次后固定5分钟
+            base_delay = 120  # 30次后固定2分钟，而不是5分钟
         
         # 如果有成功连接历史，考虑调整策略
         if self.last_successful_time and self.successful_connections > 0:

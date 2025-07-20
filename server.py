@@ -70,7 +70,7 @@ class TunnelServer:
         self.pending_requests = {}  # request_id -> response_event, response_data
         self.running = False
         self.client_last_seen = {}  # 记录客户端最后活跃时间
-        self.heartbeat_timeout = 180  # 心跳超时时间（秒）增加到3分钟
+        self.heartbeat_timeout = 120  # 心跳超时时间（秒）2分钟
         self.current_connections = 0  # 改为实例变量
         self.timeout = 300  # 增加超时时间到5分钟
         self.shutdown_event = threading.Event()  # 优雅关闭事件
@@ -1139,12 +1139,12 @@ class TunnelServer:
                     except ImportError:
                         pass  # psutil不可用时跳过内存检查
                     
-                    # 等待60秒或关闭事件
-                    if self.shutdown_event.wait(60):
+                    # 等待30秒或关闭事件（提高检测频率）
+                    if self.shutdown_event.wait(30):
                         break
                 except Exception as e:
                     logging.error(f"监控错误: {e}")
-                    if self.shutdown_event.wait(60):
+                    if self.shutdown_event.wait(30):
                         break
         
         monitor_thread = threading.Thread(target=monitor_connections, name="ConnectionMonitor")
