@@ -15,16 +15,42 @@ import uuid
 import select
 import signal
 import sys
+from logging.handlers import RotatingFileHandler
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("tunnel_client.log", mode='w'),
-        logging.StreamHandler()
-    ]
-)
+# 配置日志轮转
+def setup_logging():
+    """设置日志配置，包含轮转功能"""
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    # 清除现有的处理器
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    
+    # 文件处理器 - 轮转日志
+    file_handler = RotatingFileHandler(
+        "tunnel_client.log", 
+        maxBytes=5*1024*1024,  # 5MB
+        backupCount=3,         # 保留3个备份
+        encoding='utf-8'
+    )
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    
+    # 控制台处理器
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+# 初始化日志
+setup_logging()
+
+# 设置Windows环境下的标准输出编码为UTF-8
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+elif hasattr(sys.stdout, 'buffer'):
+    sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
 
 class TunnelClient:
     def __init__(self, server_host, server_port, local_host, local_port, tunnel_id=None, subdomain=None, use_ssl=True):
@@ -42,15 +68,18 @@ class TunnelClient:
         self.running = False
         self.control_socket = None
         self.reconnect_delay = 5  # 初始重连延迟改为5秒
-        self.max_reconnect_delay = 60  # 最大重连延迟1分钟
+        self.max_reconnect_delay = 300  # 最大重连延迟5分钟
         self.reconnect_attempts = 0  # 重连尝试次数
         self.max_reconnect_attempts = 999  # 无限重连
+        self.successful_connections = 0  # 成功连接次数
+        self.last_successful_time = None  # 最后一次成功连接时间
         self.last_heartbeat_received = time.time()  # 最后收到心跳的时间
         self.heartbeat_timeout = 180  # 心跳超时时间增加到3分钟
         self.heartbeat_thread = None
         self.message_handler_thread = None
         self.connection_lock = threading.Lock()  # 连接锁
         self.shutdown_event = threading.Event()  # 优雅关闭事件
+        self.memory_cleanup_counter = 0  # 内存清理计数器
         
         # 注册信号处理器
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -137,10 +166,13 @@ class TunnelClient:
                             logging.error("注册失败，重新连接")
                             continue
                         
-                        # 连接成功，重置重连参数
+                        # 连接成功，重置重连参数并记录成功连接
+                        self.successful_connections += 1
+                        self.last_successful_time = time.time()
                         self.reconnect_delay = 5
                         self.reconnect_attempts = 0
                         self.last_heartbeat_received = time.time()
+                        logging.info(f"连接成功 (第{self.successful_connections}次成功连接)")
                         
                         # 启动心跳线程
                         self._start_heartbeat_thread()
@@ -170,12 +202,8 @@ class TunnelClient:
             if self.running and not self.shutdown_event.is_set():
                 self.reconnect_attempts += 1
                 
-                # 改进的重连算法 - 无限重连
-                # 使用指数退避策略，但有最大延迟限制
-                if self.reconnect_attempts <= 5:
-                    current_delay = min(self.reconnect_delay * (2 ** (self.reconnect_attempts - 1)), self.max_reconnect_delay)
-                else:
-                    current_delay = self.max_reconnect_delay
+                # 智能重连算法
+                current_delay = self._calculate_reconnect_delay()
                 
                 logging.info(f"第 {self.reconnect_attempts} 次重连失败，将在 {current_delay} 秒后重试")
                 if self.shutdown_event.wait(current_delay):
@@ -239,6 +267,11 @@ class TunnelClient:
                     else:
                         logging.error("心跳发送失败")
                         break
+                    
+                    # 内存清理检查
+                    self.memory_cleanup_counter += 1
+                    if self.memory_cleanup_counter % 10 == 0:  # 每10次心跳清理一次
+                        self._perform_memory_cleanup()
                     
                     # 等待下次心跳或关闭事件
                     if self.shutdown_event.wait(heartbeat_interval):
@@ -697,6 +730,69 @@ class TunnelClient:
             self.control_socket = None
         
         logging.info("客户端停止完成")
+    
+    def _calculate_reconnect_delay(self):
+        """智能计算重连延迟时间"""
+        current_time = time.time()
+        
+        # 基础指数退避策略
+        if self.reconnect_attempts <= 5:
+            base_delay = min(self.reconnect_delay * (2 ** (self.reconnect_attempts - 1)), 60)
+        elif self.reconnect_attempts <= 20:
+            base_delay = 60  # 前20次失败后固定1分钟
+        elif self.reconnect_attempts <= 50:
+            base_delay = 120  # 21-50次失败后固定2分钟
+        else:
+            base_delay = self.max_reconnect_delay  # 50次后固定5分钟
+        
+        # 如果有成功连接历史，考虑调整策略
+        if self.last_successful_time and self.successful_connections > 0:
+            time_since_last_success = current_time - self.last_successful_time
+            
+            # 如果最近连接过（1小时内），减少延迟
+            if time_since_last_success < 3600:  # 1小时
+                base_delay = min(base_delay, 30)
+                logging.debug(f"最近连接成功过，减少重连延迟至{base_delay}秒")
+            
+            # 如果长时间没有连接成功（超过6小时），增加延迟
+            elif time_since_last_success > 21600:  # 6小时
+                base_delay = min(base_delay * 2, self.max_reconnect_delay)
+                logging.debug(f"长时间连接失败，增加重连延迟至{base_delay}秒")
+        
+        # 连接成功率调整
+        if self.successful_connections > 0:
+            failure_rate = self.reconnect_attempts / (self.successful_connections + self.reconnect_attempts)
+            if failure_rate > 0.8:  # 失败率超过80%
+                base_delay = min(base_delay * 1.5, self.max_reconnect_delay)
+                logging.debug(f"连接失败率较高({failure_rate:.2%})，增加延迟")
+        
+        return int(base_delay)
+    
+    def _perform_memory_cleanup(self):
+        """执行内存清理操作"""
+        try:
+            import gc
+            
+            # 强制垃圾回收
+            collected = gc.collect()
+            
+            # 检查内存使用情况
+            try:
+                import psutil
+                process = psutil.Process()
+                memory_info = process.memory_info()
+                memory_mb = memory_info.rss / 1024 / 1024
+                
+                if memory_mb > 100:  # 如果内存使用超过100MB
+                    logging.warning(f"内存使用较高: {memory_mb:.1f}MB，已清理{collected}个对象")
+                else:
+                    logging.debug(f"内存清理完成: {memory_mb:.1f}MB，清理{collected}个对象")
+                    
+            except ImportError:
+                logging.debug(f"内存清理完成，清理{collected}个对象")
+                
+        except Exception as e:
+            logging.error(f"内存清理失败: {e}")
 
 
 

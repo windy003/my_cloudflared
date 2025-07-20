@@ -20,16 +20,42 @@ import requests  # 新增导入
 import select
 import signal
 import sys
+from logging.handlers import RotatingFileHandler
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("tunnel_server.log", mode='w'),
-        logging.StreamHandler()
-    ]
-)
+# 配置日志轮转
+def setup_logging():
+    """设置日志配置，包含轮转功能"""
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    # 清除现有的处理器
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    
+    # 文件处理器 - 轮转日志
+    file_handler = RotatingFileHandler(
+        "tunnel_server.log", 
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5,          # 保留5个备份
+        encoding='utf-8'
+    )
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    
+    # 控制台处理器
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+# 初始化日志
+setup_logging()
+
+# 设置标准输出编码为UTF-8
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+elif hasattr(sys.stdout, 'buffer'):
+    sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
 
 class TunnelServer:
     def __init__(self, bind_host, bind_port, http_port, use_ssl=True, cert_file=None, key_file=None):

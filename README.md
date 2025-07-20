@@ -2,134 +2,73 @@
 
 简单的内网穿透工具，支持HTTP流量转发。
 
-## 文件说明
+## 核心文件
 
 - `server.py` - 服务器端程序
-- `client.py` - 客户端程序
-- `start_server.bat` / `start_server.sh` - 服务器后台启动脚本
-- `start_client.bat` / `start_client.sh` - 客户端后台启动脚本
+- `client.py` - 客户端程序  
 
 ## 快速开始
 
-### 1. 服务器端部署（Linux）
+### 1. 服务器端部署（VPS）
 
 ```bash
-# 前台运行
+# 无SSL模式启动
 python3 server.py --control-port 8000 --http-port 80 --no-ssl
 
-# 后台运行
-./start_server.sh
-```
-
-### 2. 客户端部署（Windows）
-
-```bat
-# 前台运行
-python client.py --server 144.202.26.208 --server-port 8000 --local 127.0.0.1 --local-port 5008 --subdomain p --no-ssl
-
-# 后台运行
-start_client.bat
-```
-
-### 3. 客户端部署（Linux）
-
-```bash
-# 前台运行
-python3 client.py --server 144.202.26.208 --server-port 8000 --local 127.0.0.1 --local-port 5008 --subdomain p --no-ssl
-
-# 后台运行
-./start_client.sh
-```
-
-## 参数说明
-
-### 服务器参数
-- `--host` - 绑定地址，默认 0.0.0.0
-- `--control-port` - 控制端口，默认 8000
-- `--http-port` - HTTP端口，默认 80
-- `--no-ssl` - 禁用SSL
-- `--cert` - SSL证书文件路径
-- `--key` - SSL密钥文件路径
-
-### 客户端参数
-- `--server` - 服务器地址
-- `--server-port` - 服务器端口，默认 8000
-- `--local` - 本地服务地址，默认 127.0.0.1
-- `--local-port` - 本地服务端口
-- `--subdomain` - 子域名
-- `--no-ssl` - 禁用SSL
-
-## 使用示例
-
-### 无SSL模式（推荐）
-
-**服务器：**
-```bash
-python3 server.py --control-port 8000 --http-port 80 --no-ssl
-```
-
-**客户端：**
-```bash
-python3 client.py --server 144.202.26.208 --server-port 8000 --local 127.0.0.1 --local-port 5008 --subdomain p --no-ssl
-```
-
-**访问：**
-- `http://服务器IP/` - 查看服务器状态
-- `http://p.域名/` - 通过子域名访问
-
-### SSL模式
-
-**服务器：**
-```bash
+# SSL模式启动
 sudo python3 server.py --control-port 8000 --http-port 443 --cert /path/to/cert.pem --key /path/to/key.pem
 ```
 
-**客户端：**
-```bash
-python3 client.py --server 域名 --server-port 8000 --local 127.0.0.1 --local-port 5008 --subdomain p
-```
-
-## 后台运行
-
-### Windows后台运行
-使用 `pythonw` 和 `start /b` 命令：
-
-```bat
-# 服务器后台运行
-start /b pythonw server.py --control-port 8000 --http-port 80 --no-ssl
-
-# 客户端后台运行
-start /b pythonw client.py --server 144.202.26.208 --server-port 8000 --local 127.0.0.1 --local-port 5008 --subdomain p --no-ssl
-```
-
-或直接运行：
-- `start_server.bat` - 服务器后台启动
-- `start_client.bat` - 客户端后台启动
-
-### Linux后台运行
-使用 `nohup` 命令：
+### 2. 客户端部署
 
 ```bash
-# 服务器后台运行
-nohup python3 server.py --control-port 8000 --http-port 80 --no-ssl > tunnel_server.log 2>&1 &
+# 基本启动命令
+python client.py --server YOUR_SERVER_IP --server-port 8000 --local 127.0.0.1 --local-port LOCAL_PORT --subdomain SUBDOMAIN
 
-# 客户端后台运行
-nohup python3 client.py --server 144.202.26.208 --server-port 8000 --local 127.0.0.1 --local-port 5008 --subdomain p --no-ssl > tunnel_client.log 2>&1 &
+# 示例：连接到服务器并暴露本地5008端口
+python client.py --server 144.202.26.208 --server-port 8000 --local 127.0.0.1 --local-port 5008 --subdomain p
 ```
 
-或直接运行：
-- `./start_server.sh` - 服务器后台启动
-- `./start_client.sh` - 客户端后台启动
+## 使用说明
 
-## 日志文件
+### 服务器参数
+- `--control-port` - 控制端口（默认8000）
+- `--http-port` - HTTP端口（默认8080，避免权限问题）
+- `--no-ssl` - 禁用SSL模式
 
-- `tunnel_server.log` - 服务器日志
-- `tunnel_client.log` - 客户端日志
+### 客户端参数
+- `--server` - 服务器地址
+- `--server-port` - 服务器端口（默认8000）
+- `--local` - 本地服务地址
+- `--local-port` - 本地服务端口
+- `--subdomain` - 子域名
+- `--no-ssl` - 禁用SSL模式
+
+## 访问方式
+
+- `http://服务器IP:8080/` - 查看服务器状态
+- `http://子域名.域名:8080/` - 通过子域名访问
+
+## 故障排除
+
+常见问题：
+1. **连接失败** - 检查服务器地址、端口和网络连接
+2. **服务停止** - 查看日志文件中的错误信息
+3. **端口占用** - 确保指定端口未被其他程序占用
 
 ## 停止服务
 
-### Windows
-```bat
+**Linux/VPS：**
+```bash
+# 查找进程
+ps aux | grep python
+
+# 终止进程
+kill 进程ID
+```
+
+**Windows：**
+```cmd
 # 查找进程
 tasklist | findstr python
 
@@ -137,49 +76,43 @@ tasklist | findstr python
 taskkill /f /pid 进程ID
 ```
 
-### Linux
-```bash
-# 查找进程
-ps aux | grep python
-
-# 终止进程
-kill 进程ID
-
-# 或者终止所有相关进程
-pkill -f server.py
-pkill -f client.py
-```
-
 ## 功能特性
 
-- **自动重连** - 客户端支持无限重连
-- **心跳检测** - 自动检测连接状态
-- **多客户端** - 支持多个客户端同时连接
-- **子域名支持** - 通过子域名访问不同的隧道
-- **日志记录** - 详细的运行日志
-- **SSL支持** - 可选的SSL加密传输
+### 🔄 智能重连策略
+- **指数退避算法**: 失败次数越多，重连间隔越长
+- **自适应延迟**: 根据连接成功历史动态调整重连时间
+- **连接成功率监控**: 失败率过高时自动增加重连延迟
 
-## 故障排除
+### 📊 日志轮转机制
+- **客户端日志**: 自动轮转，最大5MB，保留3个备份文件
+- **服务器日志**: 自动轮转，最大10MB，保留5个备份文件
+- **防止日志文件过大**: 避免磁盘空间不足
 
-1. **连接失败**
-   - 检查服务器地址和端口
-   - 确认防火墙设置
-   - 检查网络连接
+### 💾 内存优化
+- **定期清理**: 每10次心跳自动执行垃圾回收
+- **内存监控**: 实时监控内存使用情况
+- **高内存告警**: 使用量过高时自动告警
 
-2. **无法访问**
-   - 确认本地服务运行正常
-   - 检查端口是否被占用
-   - 查看日志文件
+## 日志分析
 
-3. **服务停止**
-   - 查看日志文件中的错误信息
-   - 检查系统资源
-   - 重启服务
+### 查看日志
+```bash
+# 查看服务器日志
+tail -f tunnel_server.log
+
+# 查看客户端日志
+tail -f tunnel_client.log
+
+# 检查重连情况
+grep "重连" tunnel_client.log | tail -10
+
+# 检查连接状态
+grep "客户端.*注册" tunnel_server.log | tail -5
+```
 
 ## 注意事项
 
 - 服务器需要公网IP
-- 客户端需要能访问服务器
 - 建议在防火墙中开放相应端口
-- 定期检查日志文件大小
-- 生产环境建议使用SSL
+- 智能重连会根据网络状况自动调整策略
+- 日志文件会自动轮转，无需手动清理

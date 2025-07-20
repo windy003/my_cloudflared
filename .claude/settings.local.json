@@ -2,7 +2,14 @@
   "permissions": {
     "allow": [
       "Bash(chmod:*)",
-      "Bash(rm:*)"
+      "Bash(rm:*)",
+      "Bash(python3:*)",
+      "Bash(find:*)",
+      "Bash(ls:*)",
+      "Bash(./start_server.sh:*)",
+      "Bash(cat:*)",
+      "Bash(del:*)",
+      "Bash(claude auth status)"
     ],
     "deny": []
   }
