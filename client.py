@@ -67,19 +67,18 @@ class TunnelClient:
         self.use_ssl = use_ssl
         self.running = False
         self.control_socket = None
-        self.reconnect_delay = 5  # 初始重连延迟改为5秒
+        self.reconnect_delay = 2  # 初始重连延迟2秒
         self.max_reconnect_delay = 300  # 最大重连延迟5分钟
         self.reconnect_attempts = 0  # 重连尝试次数
         self.max_reconnect_attempts = 999  # 无限重连
         self.successful_connections = 0  # 成功连接次数
         self.last_successful_time = None  # 最后一次成功连接时间
         self.last_heartbeat_received = time.time()  # 最后收到心跳的时间
-        self.heartbeat_timeout = 180  # 心跳超时时间增加到3分钟
+        self.heartbeat_timeout = 90  # 心跳超时时间降到90秒
         self.heartbeat_thread = None
         self.message_handler_thread = None
         self.connection_lock = threading.Lock()  # 连接锁
         self.shutdown_event = threading.Event()  # 优雅关闭事件
-        self.memory_cleanup_counter = 0  # 内存清理计数器
         
         # 注册信号处理器
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -169,7 +168,7 @@ class TunnelClient:
                         # 连接成功，重置重连参数并记录成功连接
                         self.successful_connections += 1
                         self.last_successful_time = time.time()
-                        self.reconnect_delay = 5
+                        self.reconnect_delay = 2
                         self.reconnect_attempts = 0
                         self.last_heartbeat_received = time.time()
                         logging.info(f"连接成功 (第{self.successful_connections}次成功连接)")
@@ -196,6 +195,7 @@ class TunnelClient:
                             except:
                                 pass
                             self.control_socket = None
+                        
                         
             except Exception as e:
                 logging.error(f"连接过程错误: {e}")
@@ -246,7 +246,7 @@ class TunnelClient:
             return
             
         def heartbeat_worker():
-            heartbeat_interval = 20  # 20秒发送一次心跳（提高检测频率）
+            heartbeat_interval = 15  # 15秒发送一次心跳（提高检测频率）
             heartbeat_count = 0
             
             logging.info(f"心跳线程启动，间隔: {heartbeat_interval}秒")
@@ -255,7 +255,7 @@ class TunnelClient:
                 try:
                     # 检查心跳超时
                     current_time = time.time()
-                    if current_time - self.last_heartbeat_received > 60:  # 60秒心跳超时
+                    if current_time - self.last_heartbeat_received > 45:  # 45秒心跳超时
                         logging.warning(f"心跳超时，最后心跳时间: {self.last_heartbeat_received}, 当前时间: {current_time}")
                         break
                     
@@ -273,9 +273,8 @@ class TunnelClient:
                         logging.error("心跳发送失败")
                         break
                     
-                    # 内存清理检查
-                    self.memory_cleanup_counter += 1
-                    if self.memory_cleanup_counter % 10 == 0:  # 每10次心跳清理一次
+                    # 简单的内存清理
+                    if heartbeat_count % 30 == 0:  # 每30次心跳清理一次
                         self._perform_memory_cleanup()
                     
                     # 等待下次心跳或关闭事件
@@ -359,7 +358,7 @@ class TunnelClient:
                 logging.warning("心跳超时，准备重连")
                 break
             
-            time.sleep(1)
+            time.sleep(5)
     
     def _cleanup_connection(self):
         """清理连接资源"""
@@ -740,28 +739,33 @@ class TunnelClient:
         """智能计算重连延迟时间"""
         current_time = time.time()
         
-        # 优化的重连策略 - 更快的恢复
-        if self.reconnect_attempts <= 3:
-            base_delay = min(self.reconnect_delay * (self.reconnect_attempts), 15)  # 5, 10, 15秒
-        elif self.reconnect_attempts <= 10:
-            base_delay = 30  # 4-10次失败后30秒
+        # 更积极的重连策略
+        if self.reconnect_attempts <= 5:
+            base_delay = min(self.reconnect_delay * (self.reconnect_attempts), 10)  # 2, 4, 6, 8, 10秒
+        elif self.reconnect_attempts <= 15:
+            base_delay = 15  # 6-15次失败后15秒
         elif self.reconnect_attempts <= 30:
-            base_delay = 60  # 11-30次失败后1分钟
+            base_delay = 30  # 16-30次失败后30秒
+        elif self.reconnect_attempts <= 60:
+            base_delay = 60  # 31-60次失败后1分钟
         else:
-            base_delay = 120  # 30次后固定2分钟，而不是5分钟
+            base_delay = 90  # 60次后固定90秒
         
         # 如果有成功连接历史，考虑调整策略
         if self.last_successful_time and self.successful_connections > 0:
             time_since_last_success = current_time - self.last_successful_time
             
-            # 如果最近连接过（1小时内），减少延迟
-            if time_since_last_success < 3600:  # 1小时
-                base_delay = min(base_delay, 30)
-                logging.debug(f"最近连接成功过，减少重连延迟至{base_delay}秒")
-            
+            # 如果最近连接过（30分钟内），快速重连
+            if time_since_last_success < 1800:  # 30分钟
+                base_delay = min(base_delay, 10)
+                logging.debug(f"最近连接成功过，快速重连延迟{base_delay}秒")
+            # 如果1小时内连接过，中等延迟
+            elif time_since_last_success < 3600:  # 1小时
+                base_delay = min(base_delay, 20)
+                logging.debug(f"1小时内连接成功过，减少重连延迟至{base_delay}秒")
             # 如果长时间没有连接成功（超过6小时），增加延迟
             elif time_since_last_success > 21600:  # 6小时
-                base_delay = min(base_delay * 2, self.max_reconnect_delay)
+                base_delay = min(base_delay * 1.5, self.max_reconnect_delay)
                 logging.debug(f"长时间连接失败，增加重连延迟至{base_delay}秒")
         
         # 连接成功率调整
@@ -774,30 +778,13 @@ class TunnelClient:
         return int(base_delay)
     
     def _perform_memory_cleanup(self):
-        """执行内存清理操作"""
+        """执行简单的内存清理"""
         try:
             import gc
-            
-            # 强制垃圾回收
             collected = gc.collect()
-            
-            # 检查内存使用情况
-            try:
-                import psutil
-                process = psutil.Process()
-                memory_info = process.memory_info()
-                memory_mb = memory_info.rss / 1024 / 1024
-                
-                if memory_mb > 100:  # 如果内存使用超过100MB
-                    logging.warning(f"内存使用较高: {memory_mb:.1f}MB，已清理{collected}个对象")
-                else:
-                    logging.debug(f"内存清理完成: {memory_mb:.1f}MB，清理{collected}个对象")
-                    
-            except ImportError:
-                logging.debug(f"内存清理完成，清理{collected}个对象")
-                
+            logging.debug(f"内存清理完成，清理{collected}个对象")
         except Exception as e:
-            logging.error(f"内存清理失败: {e}")
+            logging.debug(f"内存清理失败: {e}")
 
 
 
